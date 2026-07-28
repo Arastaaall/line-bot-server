@@ -1,6 +1,7 @@
 fastapi
-uvicorn
+uvicorn[standard]
 line-bot-sdk
 google-genai
 gspread
 google-auth
+nest_asyncio
