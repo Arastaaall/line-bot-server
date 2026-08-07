@@ -29,6 +29,20 @@ line_messaging_api = MessagingApi(api_client)
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
+
+@app.get("/health")
+async def health_check():
+    """Renderがサーバーの生存確認に使う、鍵を見せない安全な確認口。"""
+    required = [
+        "LINE_CHANNEL_SECRET",
+        "LINE_CHANNEL_ACCESS_TOKEN",
+        "GEMINI_API_KEY",
+        "SPREADSHEET_ID",
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
+    ]
+    missing = [name for name in required if not os.environ.get(name)]
+    return {"status": "ok" if not missing else "configuration_incomplete", "missing_count": len(missing)}
+
 def send_reply_sync(reply_token, text):
     """LINE Reply送信（スレッド安全な同期処理）"""
     line_messaging_api.reply_message(
