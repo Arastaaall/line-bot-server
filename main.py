@@ -9,7 +9,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 from linebot.v3 import WebhookParser
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
@@ -32,6 +34,12 @@ parser = WebhookParser(CHANNEL_SECRET)
 config = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 api_client = ApiClient(config)
 line_messaging_api = MessagingApi(api_client)
+
+
+@app.get("/ping", response_class=PlainTextResponse)
+async def ping():
+    """UptimeRobot用。外部APIを呼ばず、サーバーが起きていることだけを返す。"""
+    return "OK"
 
 @app.get("/health")
 async def health_check():
@@ -225,7 +233,8 @@ def correction_is_open(user):
     for pattern in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%m/%d/%Y %H:%M:%S"):
         try:
             updated = datetime.strptime(updated_at, pattern)
-            return datetime.now() - updated <= timedelta(minutes=5)
+            now_jst = datetime.now(ZoneInfo("Asia/Tokyo")).replace(tzinfo=None)
+            return now_jst - updated <= timedelta(minutes=5)
         except ValueError:
             pass
     return False
