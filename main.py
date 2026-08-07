@@ -8,6 +8,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Request
 from linebot.v3 import WebhookParser
 from linebot.v3.exceptions import InvalidSignatureError
@@ -167,8 +168,71 @@ def initial_setup_message(user_id, text):
         )
 
     if text in ("使い方", "つかいかた", "ヘルプ", "ガイド"):
-        return "食事写真を送ると、料理とカロリーを記録します。設定をやり直すときは「リセット」と送ってください。"
+        return "食事写真を送ると、料理とカロリーを記録します。判定の直後なら、料理名や量を送って修正できます。設定をやり直すときは「リセット」と送ってください。"
+    if text in ("総", "総合", "トータル", "カロリー", "本日", "今日", "合計", "確認"):
+        if status == "awaiting_correction":
+            sheets.save_user(user_id, "completed")
+        return build_today_summary(user)
+    if text in ("振り返る", "振り返り"):
+        if status == "awaiting_correction":
+            sheets.save_user(user_id, "completed")
+        return build_today_reflection(user_id, user)
+    if status == "awaiting_correction":
+        if correction_is_open(user):
+            return correct_last_meal(user_id, user, text)
+        sheets.save_user(user_id, "completed")
     return "設定は完了しています。食事写真を送ってください。設定をやり直すときは「リセット」と送ってください。"
+
+
+def correction_is_open(user):
+    """解析結果を修正できる5分間が、まだ終わっていないか確認する。"""
+    updated_at = str(user.get("updated_at") or "")
+    for pattern in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%m/%d/%Y %H:%M:%S"):
+        try:
+            updated = datetime.strptime(updated_at, pattern)
+            return datetime.now() - updated <= timedelta(minutes=5)
+        except ValueError:
+            pass
+    return False
+
+
+def build_today_summary(user):
+    """今日のカロリー合計と、目標までの残りを伝える。"""
+    logs = sheets.get_today_logs(user["user_id"])
+    total = sum(float(log.get("calories") or 0) for log in logs)
+    target = float(user.get("target_calories") or 0)
+    remaining = round(target - total)
+    message = (
+        "📊 【本日の摂取状況】\n\n"
+        f"本日累計: {round(total)} / {round(target)} kcal\n"
+        f"残り可変枠: {remaining} kcal\n\n"
+    )
+    if remaining >= 0:
+        return message + f"目標まであと {remaining} kcal です。無理のない範囲で続けましょう。"
+    return message + f"目標を {abs(remaining)} kcal オーバーしています。無理のない範囲で調整しましょう。"
+
+
+def build_today_reflection(user_id, user):
+    """今日に記録した料理とPFCの合計を、短い文章で振り返る。"""
+    logs = sheets.get_today_logs(user_id)
+    if not logs:
+        return "本日の記録はまだありません。食事写真を送ると、ここに記録されます。"
+    total_calories = sum(float(log.get("calories") or 0) for log in logs)
+    total_protein = sum(float(log.get("protein") or 0) for log in logs)
+    total_fat = sum(float(log.get("fat") or 0) for log in logs)
+    total_carbs = sum(float(log.get("carbs") or 0) for log in logs)
+    menu_list = "".join(f"・{log.get('menu_name', '食事')}（約{log.get('calories', 0)}kcal）\n" for log in logs)
+    target = float(user.get("target_calories") or 0)
+    remaining = round(target - total_calories)
+    comment = "目標内に収まっています。この調子でいきましょう。" if remaining >= 0 else "少しオーバーしています。明日は無理のない範囲で調整しましょう。"
+    return (
+        "【本日の振り返り】\n\n"
+        f"{menu_list}\n"
+        f"合計カロリー: {round(total_calories)} / {round(target)} kcal\n"
+        f"残り可変枠: {remaining} kcal\n"
+        f"(P:{round(total_protein, 1)}g / F:{round(total_fat, 1)}g / C:{round(total_carbs, 1)}g)\n\n"
+        f"{comment}"
+    )
 
 
 async def process_follow_event(event):
@@ -179,7 +243,14 @@ async def process_follow_event(event):
 
 async def process_text_event(event):
     user_id = event.source.user_id
-    message = await asyncio.to_thread(initial_setup_message, user_id, event.message.text)
+    try:
+        message = await asyncio.to_thread(initial_setup_message, user_id, event.message.text)
+    except Exception as exc:
+        try:
+            await asyncio.to_thread(sheets.save_error_log, user_id, "process_text_event", str(exc))
+        except Exception:
+            pass
+        message = "処理中に問題が起きました。少し時間をおいて、もう一度送ってください。"
     await asyncio.to_thread(send_reply_sync, event.reply_token, message)
 
 MEDICAL_GUARDRAIL = (
@@ -248,6 +319,11 @@ def analyze_image(image_bytes, mime_type):
     except (urllib.error.URLError, json.JSONDecodeError) as exc:
         raise RuntimeError("Geminiの解析結果を受け取れませんでした。") from exc
 
+    return parse_analysis_result(response_json)
+
+
+def parse_analysis_result(response_json):
+    """Geminiの返事から、保存に必要な6つの値だけを取り出す。"""
     try:
         raw_text = response_json["candidates"][0]["content"]["parts"][0]["text"]
         first_brace, last_brace = raw_text.find("{"), raw_text.rfind("}")
@@ -265,6 +341,74 @@ def analyze_image(image_bytes, mime_type):
         }
     except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise RuntimeError("Geminiの解析結果の形式が正しくありませんでした。") from exc
+
+
+def re_analyze_meal(previous_menu, correction_text):
+    """ユーザーの補足を使い、直前の食事をもう一度計算する。"""
+    model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+    prompt = (
+        f"直前の判定メニュー: 「{previous_menu}」\n"
+        f"ユーザーからの修正・補足入力: 「{correction_text}」\n\n"
+        "ユーザーの入力は直前の食事への補足や一部修正です。元の食事に含まれていた要素は原則保持し、"
+        "修正後の全体の料理名、カロリー、PFC、助言を次のJSON形式のみで返してください。\n\n"
+        "{\n"
+        '  "menu_name": "料理名",\n'
+        '  "calories": 600,\n'
+        '  "protein": 20,\n'
+        '  "fat": 15,\n'
+        '  "carbs": 80,\n'
+        '  "suggestion": "アドバイスメッセージ"\n'
+        "}"
+        + MEDICAL_GUARDRAIL
+    )
+    encoded_key = urllib.parse.quote(GEMINI_API_KEY or "", safe="")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={encoded_key}"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps({"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return parse_analysis_result(json.loads(response.read().decode("utf-8")))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Geminiの再計算に失敗しました（HTTP {exc.code}）。") from exc
+    except (urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Geminiの再計算結果を受け取れませんでした。") from exc
+
+
+def correct_last_meal(user_id, user, correction_text):
+    """直前の食事ログを、Geminiの再計算結果へ入れ替える。"""
+    last_log = sheets.get_last_log(user_id)
+    if last_log is None:
+        sheets.save_user(user_id, "completed")
+        return "修正する食事記録が見つかりませんでした。食事写真を送ってください。"
+    _, log = last_log
+    result = re_analyze_meal(log.get("menu_name") or "", correction_text)
+    sheets.update_last_log(
+        user_id,
+        result["menu_name"],
+        result["calories"],
+        result["protein"],
+        result["fat"],
+        result["carbs"],
+        result["suggestion"],
+    )
+    sheets.save_user(user_id, "completed")
+    today_logs = sheets.get_today_logs(user_id)
+    total = sum(float(item.get("calories") or 0) for item in today_logs)
+    target = float(user.get("target_calories") or 0)
+    return (
+        "🔄 【修正・再計算結果】\n"
+        f"メニュー: {result['menu_name']}\n"
+        f"カロリー: 約{result['calories']} kcal\n"
+        f"(P:{result['protein']}g / F:{result['fat']}g / C:{result['carbs']}g)\n\n"
+        "【本日の状況】\n"
+        f"本日累計: {round(total)} / {round(target)} kcal\n"
+        f"残り可変枠: {round(target - total)} kcal\n\n"
+        f"【次の食事の目安】\n{result['suggestion']}"
+    )
 
 
 def save_analysis_and_build_message(user_id, user, result):
