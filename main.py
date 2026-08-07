@@ -3,6 +3,11 @@ nest_asyncio.apply()
 
 import os
 import asyncio
+import base64
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
 from fastapi import FastAPI, HTTPException, Request
 from linebot.v3 import WebhookParser
 from linebot.v3.exceptions import InvalidSignatureError
@@ -11,7 +16,6 @@ from linebot.v3.messaging import (
     ReplyMessageRequest, PushMessageRequest, TextMessage
 )
 from linebot.v3.webhooks import FollowEvent, ImageMessageContent, MessageEvent, TextMessageContent
-from google import genai
 import sheets
 
 app = FastAPI()
@@ -27,9 +31,6 @@ parser = WebhookParser(CHANNEL_SECRET)
 config = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 api_client = ApiClient(config)
 line_messaging_api = MessagingApi(api_client)
-
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-
 
 @app.get("/health")
 async def health_check():
@@ -181,14 +182,114 @@ async def process_text_event(event):
     message = await asyncio.to_thread(initial_setup_message, user_id, event.message.text)
     await asyncio.to_thread(send_reply_sync, event.reply_token, message)
 
-async def analyze_image(image_bytes: bytes) -> str:
-    """Gemini APIで画像を解析"""
-    response = await asyncio.to_thread(
-        gemini_client.models.generate_content,
-        model='gemini-2.0-flash',
-        contents=['この食事のメニュー名、概算カロリー、PFCバランスを簡潔に教えてください。', image_bytes]
+MEDICAL_GUARDRAIL = (
+    "\n\n【重要な制約】\n"
+    "・特定の疾患名を挙げた診断や、治療方針を断定する表現は行わないこと。\n"
+    "・あくまで一般的な栄養バランスの観点からの参考アドバイスに留めること。\n"
+    "・体調不良や持病が疑われる内容の場合は、医師や専門家への相談を勧めること。"
+)
+
+
+def fetch_line_image(message_id):
+    """LINEに一時保存されている画像を、メモリ上へ読み込む。"""
+    url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"},
+        method="GET",
     )
-    return response.text
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            mime_type = response.headers.get_content_type() or "image/jpeg"
+            return response.read(), mime_type
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"LINEから画像を取得できませんでした（HTTP {exc.code}）。") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError("LINEから画像を取得できませんでした。") from exc
+
+
+def analyze_image(image_bytes, mime_type):
+    """Geminiへ食事写真を渡し、保存できる形の結果だけを返す。"""
+    model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+    prompt = (
+        "この画像に写っている食事を解析してください。\n"
+        "推定される料理名、おおよそのカロリー（kcal）、PFCバランス（g）、"
+        "次にとるべき食事のアドバイスを、次のJSON形式のみで返してください。\n\n"
+        "{\n"
+        '  "menu_name": "料理名",\n'
+        '  "calories": 600,\n'
+        '  "protein": 20,\n'
+        '  "fat": 15,\n'
+        '  "carbs": 80,\n'
+        '  "suggestion": "アドバイスメッセージ"\n'
+        "}"
+        + MEDICAL_GUARDRAIL
+    )
+    payload = {
+        "contents": [{"parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode("ascii")}},
+        ]}],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }
+    encoded_key = urllib.parse.quote(GEMINI_API_KEY or "", safe="")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={encoded_key}"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response_json = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Geminiの解析に失敗しました（HTTP {exc.code}）。") from exc
+    except (urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Geminiの解析結果を受け取れませんでした。") from exc
+
+    try:
+        raw_text = response_json["candidates"][0]["content"]["parts"][0]["text"]
+        first_brace, last_brace = raw_text.find("{"), raw_text.rfind("}")
+        data = json.loads(raw_text[first_brace:last_brace + 1])
+        required = {"menu_name", "calories", "protein", "fat", "carbs", "suggestion"}
+        if first_brace < 0 or last_brace < first_brace or not required.issubset(data):
+            raise ValueError("必要な項目がありません")
+        return {
+            "menu_name": str(data["menu_name"]).strip(),
+            "calories": round(float(data["calories"])),
+            "protein": round(float(data["protein"]), 1),
+            "fat": round(float(data["fat"]), 1),
+            "carbs": round(float(data["carbs"]), 1),
+            "suggestion": str(data["suggestion"]).strip(),
+        }
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Geminiの解析結果の形式が正しくありませんでした。") from exc
+
+
+def save_analysis_and_build_message(user_id, user, result):
+    """解析結果をログへ保存し、ユーザーに返す文章を組み立てる。"""
+    user_name = user.get("user_name") or "ユーザー"
+    sheets.save_log(user_id, user_name, advice=result["suggestion"], **{
+        key: result[key] for key in ("menu_name", "calories", "protein", "fat", "carbs")
+    })
+    sheets.save_user(user_id, "awaiting_correction")
+
+    today_logs = sheets.get_today_logs(user_id)
+    today_calories = sum(float(log.get("calories") or 0) for log in today_logs)
+    target_calories = float(user.get("target_calories") or 0)
+    remaining = round(target_calories - today_calories)
+    return (
+        "【判定結果】\n"
+        f"メニュー: {result['menu_name']}\n"
+        f"カロリー: 約{result['calories']} kcal\n"
+        f"(P:{result['protein']}g / F:{result['fat']}g / C:{result['carbs']}g)\n\n"
+        "【本日の状況】\n"
+        f"本日累計: {round(today_calories)} / {round(target_calories)} kcal\n"
+        f"残り可変枠: {remaining} kcal\n\n"
+        f"【次の食事の目安】\n{result['suggestion']}\n\n"
+        "内容が違う場合は、修正内容（例:「味噌ラーメン」「大盛り」）を送ってください。"
+    )
 
 @app.post("/callback")
 async def handle_callback(request: Request):
@@ -213,9 +314,44 @@ async def handle_callback(request: Request):
 async def process_image_event(event):
     user_id = event.source.user_id
     reply_token = event.reply_token
-    # 画像解析は、LINEから本物の画像を受け取る処理を追加する次の工程で完成させる。
-    await asyncio.to_thread(
-        send_reply_sync,
-        reply_token,
-        "食事写真の解析機能は、ただいま移行作業中です。もう少しだけお待ちください。",
-    )
+    user = await asyncio.to_thread(sheets.get_user, user_id)
+    if user is None or user.get("status") not in ("completed", "awaiting_correction"):
+        await asyncio.to_thread(
+            send_reply_sync,
+            reply_token,
+            "初期設定がまだ完了していません。「リセット」と送って設定を始めてください。",
+        )
+        return
+
+    async def get_and_analyze():
+        image_bytes, mime_type = await asyncio.to_thread(fetch_line_image, event.message.id)
+        return await asyncio.to_thread(analyze_image, image_bytes, mime_type)
+
+    task = asyncio.create_task(get_and_analyze())
+    try:
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=8)
+        message = await asyncio.to_thread(save_analysis_and_build_message, user_id, user, result)
+        await asyncio.to_thread(send_reply_sync, reply_token, message)
+    except asyncio.TimeoutError:
+        await asyncio.to_thread(
+            send_reply_sync,
+            reply_token,
+            "⏳ ただいま写真を解析しています。終わり次第、こちらへお知らせします。",
+        )
+        try:
+            result = await task
+            message = await asyncio.to_thread(save_analysis_and_build_message, user_id, user, result)
+            await asyncio.to_thread(send_push_sync, user_id, message)
+            await asyncio.to_thread(sheets.save_push_log, user_id, "画像解析の結果通知")
+        except Exception:
+            await asyncio.to_thread(
+                send_push_sync,
+                user_id,
+                "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
+            )
+    except Exception:
+        await asyncio.to_thread(
+            send_reply_sync,
+            reply_token,
+            "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
+        )
