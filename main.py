@@ -63,11 +63,46 @@ def send_reply_sync(reply_token, text):
         ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=text)])
     )
 
+
+def send_reply_with_quick_replies_sync(reply_token, text):
+    """LINE公式の小さな選択ボタンを付けて返信する。"""
+    items = [
+        {"type": "action", "action": {"type": "message", "label": "📊 カロリー確認", "text": "カロリー"}},
+        {"type": "action", "action": {"type": "message", "label": "🌙 一日を振り返る", "text": "振り返る"}},
+        {"type": "action", "action": {"type": "message", "label": "💡 使い方", "text": "使い方"}},
+    ]
+    payload = {"replyToken": reply_token, "messages": [{"type": "text", "text": text, "quickReply": {"items": items}}]}
+    request = urllib.request.Request(
+        "https://api.line.me/v2/bot/message/reply",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=20):
+        pass
+
 def send_push_sync(user_id, text):
     """LINE Push送信（スレッド安全な同期処理）"""
     line_messaging_api.push_message(
         PushMessageRequest(to=user_id, messages=[TextMessage(text=text)])
     )
+
+
+def show_loading_sync(user_id, seconds=5):
+    """LINEのチャット画面に、Botが考え中である表示を出す。"""
+    payload = {"chatId": user_id, "loadingSeconds": seconds}
+    request = urllib.request.Request(
+        "https://api.line.me/v2/bot/chat/loading/start",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10):
+            pass
+    except (urllib.error.HTTPError, urllib.error.URLError):
+        # ローディング表示の失敗は、本体の返信を止めない。
+        pass
 
 
 def calculate_target_calories(user):
@@ -243,6 +278,7 @@ async def process_follow_event(event):
 
 async def process_text_event(event):
     user_id = event.source.user_id
+    await asyncio.to_thread(show_loading_sync, user_id, 5)
     try:
         message = await asyncio.to_thread(initial_setup_message, user_id, event.message.text)
     except Exception as exc:
@@ -251,7 +287,11 @@ async def process_text_event(event):
         except Exception:
             pass
         message = "処理中に問題が起きました。少し時間をおいて、もう一度送ってください。"
-    await asyncio.to_thread(send_reply_sync, event.reply_token, message)
+    current_user = await asyncio.to_thread(sheets.get_user, user_id)
+    if current_user and current_user.get("status") in ("completed", "awaiting_correction"):
+        await asyncio.to_thread(send_reply_with_quick_replies_sync, event.reply_token, message)
+    else:
+        await asyncio.to_thread(send_reply_sync, event.reply_token, message)
 
 MEDICAL_GUARDRAIL = (
     "\n\n【重要な制約】\n"
@@ -467,6 +507,8 @@ async def process_image_event(event):
         )
         return
 
+    await asyncio.to_thread(show_loading_sync, user_id, 15)
+
     async def get_and_analyze():
         image_bytes, mime_type = await asyncio.to_thread(fetch_line_image, event.message.id)
         return await asyncio.to_thread(analyze_image, image_bytes, mime_type)
@@ -475,7 +517,7 @@ async def process_image_event(event):
     try:
         result = await asyncio.wait_for(asyncio.shield(task), timeout=8)
         message = await asyncio.to_thread(save_analysis_and_build_message, user_id, user, result)
-        await asyncio.to_thread(send_reply_sync, reply_token, message)
+        await asyncio.to_thread(send_reply_with_quick_replies_sync, reply_token, message)
     except asyncio.TimeoutError:
         await asyncio.to_thread(
             send_reply_sync,
