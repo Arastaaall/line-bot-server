@@ -84,6 +84,16 @@ def _worksheet(name: str):
     return _spreadsheet().worksheet(name)
 
 
+def verify_connection() -> None:
+    """必要な4つのシートを、読み取りだけで開けるか確認する。"""
+    spreadsheet = _spreadsheet()
+    available = {sheet.title for sheet in spreadsheet.worksheets()}
+    required = {"users", "logs", "error_logs", "push_logs"}
+    missing = required - available
+    if missing:
+        raise RuntimeError(f"必要なシートが見つかりません: {sorted(missing)}")
+
+
 def _headers(sheet) -> list[str]:
     headers = sheet.row_values(1)
     if not headers:

@@ -3,7 +3,7 @@ nest_asyncio.apply()
 
 import os
 import asyncio
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from linebot.v3 import WebhookParser
 from linebot.v3.messaging import (
     ApiClient, MessagingApi, Configuration, 
@@ -42,6 +42,17 @@ async def health_check():
     ]
     missing = [name for name in required if not os.environ.get(name)]
     return {"status": "ok" if not missing else "configuration_incomplete", "missing_count": len(missing)}
+
+
+@app.get("/health/sheets")
+async def sheets_health_check():
+    """Googleスプレッドシートを読むだけで、接続と必要なシート名を確認する。"""
+    try:
+        sheets.verify_connection()
+    except Exception:
+        # 鍵やスプレッドシートIDなどの詳しい情報は、公開URLへ返さない。
+        raise HTTPException(status_code=503, detail="Googleスプレッドシートへ接続できませんでした。")
+    return {"status": "ok", "sheets_connected": True}
 
 def send_reply_sync(reply_token, text):
     """LINE Reply送信（スレッド安全な同期処理）"""
