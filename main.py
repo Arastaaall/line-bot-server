@@ -673,7 +673,7 @@ async def process_image_event(event):
 
     task = asyncio.create_task(get_and_analyze())
     try:
-        result = await asyncio.wait_for(asyncio.shield(task), timeout=8)
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=15)
         message = await asyncio.to_thread(save_analysis_and_build_message, user_id, user, result)
         await asyncio.to_thread(send_reply_with_quick_replies_sync, reply_token, message)
     except asyncio.TimeoutError:
