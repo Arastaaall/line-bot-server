@@ -184,6 +184,15 @@ def save_log(
     *,
     log_type: str = "食事",
     image_url: str = "",
+    fiber: float = 0,
+    vitamins: float = 0,
+    vit_a: float = 0,
+    vit_c: float = 0,
+    zinc: float = 0,
+    magnesium: float = 0,
+    iron: float = 0,
+    potassium: float = 0,
+    calcium: float = 0,
 ) -> None:
     _append_by_header(
         "logs",
@@ -199,6 +208,15 @@ def save_log(
             "carbs": carbs,
             "imgUrl": image_url,
             "advice": advice,
+            "fiber": fiber,
+            "vitamins": vitamins,
+            "vit_a": vit_a,
+            "vit_c": vit_c,
+            "zinc": zinc,
+            "magnesium": magnesium,
+            "iron": iron,
+            "potassium": potassium,
+            "calcium": calcium,
         },
     )
 
@@ -236,6 +254,16 @@ def update_last_log(
     fat: float,
     carbs: float,
     advice: str,
+    *,
+    fiber: float = 0,
+    vitamins: float = 0,
+    vit_a: float = 0,
+    vit_c: float = 0,
+    zinc: float = 0,
+    magnesium: float = 0,
+    iron: float = 0,
+    potassium: float = 0,
+    calcium: float = 0,
 ) -> bool:
     last_log = get_last_log(user_id)
     if last_log is None:
@@ -250,9 +278,19 @@ def update_last_log(
         "fat": fat,
         "carbs": carbs,
         "advice": advice,
+        "fiber": fiber,
+        "vitamins": vitamins,
+        "vit_a": vit_a,
+        "vit_c": vit_c,
+        "zinc": zinc,
+        "magnesium": magnesium,
+        "iron": iron,
+        "potassium": potassium,
+        "calcium": calcium,
     }
     for column, value in updates.items():
-        sheet.update_cell(row_number, headers.index(column) + 1, value)
+        if column in headers:
+            sheet.update_cell(row_number, headers.index(column) + 1, value)
     return True
 
 

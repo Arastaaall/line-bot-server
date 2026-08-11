@@ -334,13 +334,23 @@ def analyze_image(image_bytes, mime_type):
     prompt = (
         "この画像に写っている食事を解析してください。\n"
         "推定される料理名、おおよそのカロリー（kcal）、PFCバランス（g）、"
-        "次にとるべき食事のアドバイスを、次のJSON形式のみで返してください。\n\n"
+        "微量栄養素の推定値、次にとるべき食事のアドバイスを、次のJSON形式のみで返してください。\n"
+        "微量栄養素はすべて推定値で構いません。数値のみ（単位は付けない）で返してください。\n\n"
         "{\n"
         '  "menu_name": "料理名",\n'
         '  "calories": 600,\n'
         '  "protein": 20,\n'
         '  "fat": 15,\n'
         '  "carbs": 80,\n'
+        '  "fiber": 3,\n'
+        '  "vitamins": 5,\n'
+        '  "vit_a": 80,\n'
+        '  "vit_c": 15,\n'
+        '  "zinc": 1.5,\n'
+        '  "magnesium": 40,\n'
+        '  "iron": 1.2,\n'
+        '  "potassium": 400,\n'
+        '  "calcium": 60,\n'
         '  "suggestion": "アドバイスメッセージ"\n'
         "}"
         + MEDICAL_GUARDRAIL
@@ -371,8 +381,22 @@ def analyze_image(image_bytes, mime_type):
     return parse_analysis_result(response_json)
 
 
+#  微量栄養素はGeminiが省略することがあるため、必須項目には含めず、
+# 数値変換に失敗した場合や欠けている場合は0として扱う。
+MICRONUTRIENT_KEYS = (
+    "fiber", "vitamins", "vit_a", "vit_c", "zinc", "magnesium", "iron", "potassium", "calcium",
+)
+
+
+def _number_or_zero(value, digits=1):
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return 0
+
+
 def parse_analysis_result(response_json):
-    """Geminiの返事から、保存に必要な6つの値だけを取り出す。"""
+    """Geminiの返事から、保存に必要な値（主要栄養素6つ＋微量栄養素9つ）を取り出す。"""
     try:
         raw_text = response_json["candidates"][0]["content"]["parts"][0]["text"]
         first_brace, last_brace = raw_text.find("{"), raw_text.rfind("}")
@@ -380,7 +404,7 @@ def parse_analysis_result(response_json):
         required = {"menu_name", "calories", "protein", "fat", "carbs", "suggestion"}
         if first_brace < 0 or last_brace < first_brace or not required.issubset(data):
             raise ValueError("必要な項目がありません")
-        return {
+        result = {
             "menu_name": str(data["menu_name"]).strip(),
             "calories": round(float(data["calories"])),
             "protein": round(float(data["protein"]), 1),
@@ -388,6 +412,9 @@ def parse_analysis_result(response_json):
             "carbs": round(float(data["carbs"]), 1),
             "suggestion": str(data["suggestion"]).strip(),
         }
+        for key in MICRONUTRIENT_KEYS:
+            result[key] = _number_or_zero(data.get(key))
+        return result
     except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise RuntimeError("Geminiの解析結果の形式が正しくありませんでした。") from exc
 
@@ -399,13 +426,23 @@ def re_analyze_meal(previous_menu, correction_text):
         f"直前の判定メニュー: 「{previous_menu}」\n"
         f"ユーザーからの修正・補足入力: 「{correction_text}」\n\n"
         "ユーザーの入力は直前の食事への補足や一部修正です。元の食事に含まれていた要素は原則保持し、"
-        "修正後の全体の料理名、カロリー、PFC、助言を次のJSON形式のみで返してください。\n\n"
+        "修正後の全体の料理名、カロリー、PFC、微量栄養素の推定値、助言を次のJSON形式のみで返してください。\n"
+        "微量栄養素はすべて推定値で構いません。数値のみ（単位は付けない）で返してください。\n\n"
         "{\n"
         '  "menu_name": "料理名",\n'
         '  "calories": 600,\n'
         '  "protein": 20,\n'
         '  "fat": 15,\n'
         '  "carbs": 80,\n'
+        '  "fiber": 3,\n'
+        '  "vitamins": 5,\n'
+        '  "vit_a": 80,\n'
+        '  "vit_c": 15,\n'
+        '  "zinc": 1.5,\n'
+        '  "magnesium": 40,\n'
+        '  "iron": 1.2,\n'
+        '  "potassium": 400,\n'
+        '  "calcium": 60,\n'
         '  "suggestion": "アドバイスメッセージ"\n'
         "}"
         + MEDICAL_GUARDRAIL
@@ -443,6 +480,7 @@ def correct_last_meal(user_id, user, correction_text):
         result["fat"],
         result["carbs"],
         result["suggestion"],
+        **{key: result[key] for key in MICRONUTRIENT_KEYS},
     )
     sheets.save_user(user_id, "completed")
     today_logs = sheets.get_today_logs(user_id)
@@ -465,7 +503,7 @@ def save_analysis_and_build_message(user_id, user, result):
     user_name = user.get("user_name") or "ユーザー"
     sheets.save_log(user_id, user_name, advice=result["suggestion"], **{
         key: result[key] for key in ("menu_name", "calories", "protein", "fat", "carbs")
-    })
+    }, **{key: result[key] for key in MICRONUTRIENT_KEYS})
     sheets.save_user(user_id, "awaiting_correction")
 
     today_logs = sheets.get_today_logs(user_id)
