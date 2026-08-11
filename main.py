@@ -113,12 +113,41 @@ def show_loading_sync(user_id, seconds=5):
         pass
 
 
+KCAL_PER_KG = 7200  # 体重1kgの増減に必要なカロリー差の目安値
+LOSS_MAX_DAILY_DEFICIT = 750  # 減量時、1日あたりに削ってよいカロリーの安全上限
+GAIN_MAX_DAILY_SURPLUS = 500  # 増量時、1日あたりに増やしてよいカロリーの安全上限（体脂肪の増えすぎを防ぐ）
+DEFAULT_TARGET_MONTHS = 3  # target_monthsが未設定のときに使う目安期間
+GOAL_TOLERANCE_KG = 0.5  # この範囲内の体重差は「維持」とみなす
+
+
+def is_premium_user(user):
+    """is_premium列の値を、有料会員かどうかの真偽値として扱う。"""
+    value = str(user.get("is_premium") or "").strip().lower()
+    return value in ("true", "1", "yes", "premium", "有料")
+
+
+def determine_goal_mode(weight, target_weight, tolerance=GOAL_TOLERANCE_KG):
+    """現体重と目標体重の差から、維持・減量・増量のどれを目指しているか判定する。"""
+    diff = target_weight - weight
+    if abs(diff) < tolerance:
+        return "maintain"
+    return "gain" if diff > 0 else "loss"
+
+
 def calculate_target_calories(user):
-    """GAS版と同じルールで、1日の目標カロリーを計算する。"""
+    """goal_mode（維持・減量・増量）に応じて、1日の目標カロリーを計算する。
+
+    減量・増量は、目標体重までの差とtarget_months（達成希望期間）から
+    1日あたりに必要な過不足カロリーを逆算するが、健康を害するような
+    急激なペースにならないよう、安全な範囲の上限でキャップする。
+    """
     gender = user["gender"]
     age = float(user["age"])
     height = float(user["height"])
     weight = float(user["weight"])
+    target_weight = (
+        float(user["target_weight"]) if user.get("target_weight") not in ("", None) else weight
+    )
     waist = float(user["waist"]) if user.get("waist") not in ("", None) else None
     pal = float(user.get("pal") or 1.375)
 
@@ -135,8 +164,52 @@ def calculate_target_calories(user):
         bmr = (10 * weight) + (6.25 * height) - (5 * age) - 161
 
     tdee = round(bmr * pal)
-    target_calories = max(round(bmr), round(tdee - 650))
+    goal_mode = user.get("goal_mode") or determine_goal_mode(weight, target_weight)
+    months = float(user.get("target_months") or DEFAULT_TARGET_MONTHS)
+    days = max(months, 0.5) * 30
+
+    if goal_mode == "loss":
+        diff_kg = max(weight - target_weight, 0)
+        requested_daily_change = (diff_kg * KCAL_PER_KG) / days
+        safe_daily_change = min(requested_daily_change, LOSS_MAX_DAILY_DEFICIT)
+        target_calories = max(round(bmr), round(tdee - safe_daily_change))
+    elif goal_mode == "gain":
+        diff_kg = max(target_weight - weight, 0)
+        requested_daily_change = (diff_kg * KCAL_PER_KG) / days
+        safe_daily_change = min(requested_daily_change, GAIN_MAX_DAILY_SURPLUS)
+        target_calories = round(tdee + safe_daily_change)
+    else:
+        target_calories = tdee
+
     return {"tdee": tdee, "target_calories": target_calories}
+
+
+def build_pace_note(user):
+    """希望期間が安全なペースを超えていた場合、実際にかかる目安期間を伝える一言を作る。"""
+    goal_mode = user.get("goal_mode")
+    if goal_mode not in ("loss", "gain"):
+        return ""
+
+    weight = float(user["weight"])
+    target_weight = float(user["target_weight"]) if user.get("target_weight") not in ("", None) else weight
+    diff_kg = abs(target_weight - weight)
+    if diff_kg <= 0:
+        return ""
+
+    months = float(user.get("target_months") or DEFAULT_TARGET_MONTHS)
+    days = max(months, 0.5) * 30
+    requested_daily_change = (diff_kg * KCAL_PER_KG) / days
+    cap = LOSS_MAX_DAILY_DEFICIT if goal_mode == "loss" else GAIN_MAX_DAILY_SURPLUS
+
+    if requested_daily_change <= cap:
+        return ""
+
+    actual_months = (diff_kg * KCAL_PER_KG) / cap / 30
+    action = "減量" if goal_mode == "loss" else "増量"
+    return (
+        f"\n⚠️ ご希望の期間（{months}ヶ月）だと健康的な{action}ペースを超えてしまうため、"
+        f"安全な範囲のカロリーで計算しました。実際には目安として約{actual_months:.1f}ヶ月かかる見込みです。\n"
+    )
 
 
 def number_or_none(text, minimum, maximum):
@@ -201,12 +274,50 @@ def initial_setup_message(user_id, text):
             waist = number_or_none(text, 30, 250)
             if waist is None:
                 return "腹囲は30〜250の半角数字、または「パス」で教えてください。"
-        completed_user = sheets.save_user(user_id, "completed", {"waist": waist})
+        user_with_waist = sheets.save_user(user_id, "ask_waist", {"waist": waist})
+        weight = float(user_with_waist["weight"])
+        target_weight = float(user_with_waist["target_weight"])
+        goal_mode = determine_goal_mode(weight, target_weight)
+
+        if goal_mode == "gain" and not is_premium_user(user_with_waist):
+            # 無料会員は増量プラン対象外のため、体重維持として計算し、有料プランを案内する。
+            completed_user = sheets.save_user(user_id, "completed", {"goal_mode": "maintain"})
+            calories = calculate_target_calories(completed_user)
+            sheets.save_user(user_id, "completed", calories)
+            return (
+                "設定が完了しました！🎉\n\n"
+                f"1日の目標摂取カロリー：【 {calories['target_calories']} kcal 】（体重維持モード）\n\n"
+                "増量プランは有料会員限定の機能です。目標体重に向けた増量サポートをご希望の場合は、"
+                "有料プランへの登録をご検討ください。\n\n"
+                "次は食事写真を送ると、カロリーを記録できます。"
+            )
+
+        if goal_mode == "maintain":
+            completed_user = sheets.save_user(user_id, "completed", {"goal_mode": "maintain"})
+            calories = calculate_target_calories(completed_user)
+            sheets.save_user(user_id, "completed", calories)
+            return (
+                "設定が完了しました！🎉\n\n"
+                f"1日の目標摂取カロリー：【 {calories['target_calories']} kcal 】（体重維持モード）\n\n"
+                "次は食事写真を送ると、カロリーを記録できます。"
+            )
+
+        sheets.save_user(user_id, "ask_target_months", {"goal_mode": goal_mode})
+        return "目標体重までの達成希望期間を、月数で教えてください。（例: 3）\n※無理のないペースになるよう、自動で調整されます。"
+
+    if status == "ask_target_months":
+        value = number_or_none(text, 0.5, 24)
+        if value is None:
+            return "達成希望期間は0.5〜24の半角数字（月数）で教えてください。（例: 3）"
+        completed_user = sheets.save_user(user_id, "completed", {"target_months": value})
         calories = calculate_target_calories(completed_user)
         sheets.save_user(user_id, "completed", calories)
+        mode_label = "減量モード" if completed_user.get("goal_mode") == "loss" else "増量モード"
+        pace_note = build_pace_note(completed_user)
         return (
             "設定が完了しました！🎉\n\n"
-            f"1日の目標摂取カロリー：【 {calories['target_calories']} kcal 】\n\n"
+            f"1日の目標摂取カロリー：【 {calories['target_calories']} kcal 】（{mode_label}）\n"
+            f"{pace_note}\n"
             "次は食事写真を送ると、カロリーを記録できます。"
         )
 
@@ -330,7 +441,7 @@ def fetch_line_image(message_id):
 
 def analyze_image(image_bytes, mime_type):
     """Geminiへ食事写真を渡し、保存できる形の結果だけを返す。"""
-    model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+    model = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
     prompt = (
         "この画像に写っている食事を解析してください。\n"
         "推定される料理名、おおよそのカロリー（kcal）、PFCバランス（g）、"
@@ -343,7 +454,7 @@ def analyze_image(image_bytes, mime_type):
         '  "fat": 15,\n'
         '  "carbs": 80,\n'
         '  "fiber": 3,\n'
-        '  "vitamins": 5,\n'
+        '  "vitamin": 5,\n'
         '  "vit_a": 80,\n'
         '  "vit_c": 15,\n'
         '  "zinc": 1.5,\n'
@@ -384,7 +495,7 @@ def analyze_image(image_bytes, mime_type):
 #  微量栄養素はGeminiが省略することがあるため、必須項目には含めず、
 # 数値変換に失敗した場合や欠けている場合は0として扱う。
 MICRONUTRIENT_KEYS = (
-    "fiber", "vitamins", "vit_a", "vit_c", "zinc", "magnesium", "iron", "potassium", "calcium",
+    "fiber", "vitamin", "vit_a", "vit_c", "zinc", "magnesium", "iron", "potassium", "calcium",
 )
 
 
@@ -421,7 +532,7 @@ def parse_analysis_result(response_json):
 
 def re_analyze_meal(previous_menu, correction_text):
     """ユーザーの補足を使い、直前の食事をもう一度計算する。"""
-    model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+    model = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
     prompt = (
         f"直前の判定メニュー: 「{previous_menu}」\n"
         f"ユーザーからの修正・補足入力: 「{correction_text}」\n\n"
@@ -435,7 +546,7 @@ def re_analyze_meal(previous_menu, correction_text):
         '  "fat": 15,\n'
         '  "carbs": 80,\n'
         '  "fiber": 3,\n'
-        '  "vitamins": 5,\n'
+        '  "vitamin": 5,\n'
         '  "vit_a": 80,\n'
         '  "vit_c": 15,\n'
         '  "zinc": 1.5,\n'
@@ -576,13 +687,21 @@ async def process_image_event(event):
             message = await asyncio.to_thread(save_analysis_and_build_message, user_id, user, result)
             await asyncio.to_thread(send_push_sync, user_id, message)
             await asyncio.to_thread(sheets.save_push_log, user_id, "画像解析の結果通知")
-        except Exception:
+        except Exception as exc:
+            try:
+                await asyncio.to_thread(sheets.save_error_log, user_id, "process_image_event", str(exc))
+            except Exception:
+                pass
             await asyncio.to_thread(
                 send_push_sync,
                 user_id,
                 "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
             )
-    except Exception:
+    except Exception as exc:
+        try:
+            await asyncio.to_thread(sheets.save_error_log, user_id, "process_image_event", str(exc))
+        except Exception:
+            pass
         await asyncio.to_thread(
             send_reply_sync,
             reply_token,

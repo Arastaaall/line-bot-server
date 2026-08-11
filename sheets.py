@@ -101,13 +101,20 @@ def _headers(sheet) -> list[str]:
     return headers
 
 
-def _append_by_header(sheet_name: str, values: dict[str, Any]) -> None:
-    """辞書を、対象シートのヘッダー順に並べて1行追加する。"""
+def _append_by_header(sheet_name: str, values: dict[str, Any], optional_keys: set[str] | None = None) -> None:
+    """辞書を、対象シートのヘッダー順に並べて1行追加する。
+
+    optional_keys に含まれる項目は、シートにまだ列が無くても
+    エラーにせず、その項目だけを外して書き込む（将来の列追加・列名変更に強くするため）。
+    """
     sheet = _worksheet(sheet_name)
     headers = _headers(sheet)
     missing = set(values) - set(headers)
     if missing:
-        raise RuntimeError(f"シート「{sheet_name}」に見つからない列があります: {sorted(missing)}")
+        required_missing = missing - (optional_keys or set())
+        if required_missing:
+            raise RuntimeError(f"シート「{sheet_name}」に見つからない列があります: {sorted(required_missing)}")
+        values = {key: value for key, value in values.items() if key not in missing}
     sheet.append_row([values.get(header, "") for header in headers], value_input_option="USER_ENTERED")
 
 
@@ -172,6 +179,11 @@ def save_user(user_id: str, status: str, updates: dict[str, Any] | None = None) 
     return saved
 
 
+MICRONUTRIENT_COLUMNS = {
+    "fiber", "vitamin", "vit_a", "vit_c", "zinc", "magnesium", "iron", "potassium", "calcium",
+}
+
+
 def save_log(
     user_id: str,
     user_name: str,
@@ -185,7 +197,7 @@ def save_log(
     log_type: str = "食事",
     image_url: str = "",
     fiber: float = 0,
-    vitamins: float = 0,
+    vitamin: float = 0,
     vit_a: float = 0,
     vit_c: float = 0,
     zinc: float = 0,
@@ -209,7 +221,7 @@ def save_log(
             "imgUrl": image_url,
             "advice": advice,
             "fiber": fiber,
-            "vitamins": vitamins,
+            "vitamin": vitamin,
             "vit_a": vit_a,
             "vit_c": vit_c,
             "zinc": zinc,
@@ -218,6 +230,7 @@ def save_log(
             "potassium": potassium,
             "calcium": calcium,
         },
+        optional_keys=MICRONUTRIENT_COLUMNS,
     )
 
 
@@ -256,7 +269,7 @@ def update_last_log(
     advice: str,
     *,
     fiber: float = 0,
-    vitamins: float = 0,
+    vitamin: float = 0,
     vit_a: float = 0,
     vit_c: float = 0,
     zinc: float = 0,
@@ -279,7 +292,7 @@ def update_last_log(
         "carbs": carbs,
         "advice": advice,
         "fiber": fiber,
-        "vitamins": vitamins,
+        "vitamin": vitamin,
         "vit_a": vit_a,
         "vit_c": vit_c,
         "zinc": zinc,
