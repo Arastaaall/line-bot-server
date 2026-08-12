@@ -180,7 +180,7 @@ def save_user(user_id: str, status: str, updates: dict[str, Any] | None = None) 
 
 
 MICRONUTRIENT_COLUMNS = {
-    "fiber", "vitamin", "vit_a", "vit_c", "zinc", "magnesium", "iron", "potassium", "calcium",
+    "fiber", "vitamins", "vit_a", "vit_c", "zinc", "magnesium", "iron", "potassium", "calcium",
 }
 
 
@@ -197,7 +197,7 @@ def save_log(
     log_type: str = "食事",
     image_url: str = "",
     fiber: float = 0,
-    vitamin: float = 0,
+    vitamins: float = 0,
     vit_a: float = 0,
     vit_c: float = 0,
     zinc: float = 0,
@@ -221,7 +221,7 @@ def save_log(
             "imgUrl": image_url,
             "advice": advice,
             "fiber": fiber,
-            "vitamin": vitamin,
+            "vitamins": vitamins,
             "vit_a": vit_a,
             "vit_c": vit_c,
             "zinc": zinc,
@@ -269,7 +269,7 @@ def update_last_log(
     advice: str,
     *,
     fiber: float = 0,
-    vitamin: float = 0,
+    vitamins: float = 0,
     vit_a: float = 0,
     vit_c: float = 0,
     zinc: float = 0,
@@ -292,7 +292,7 @@ def update_last_log(
         "carbs": carbs,
         "advice": advice,
         "fiber": fiber,
-        "vitamin": vitamin,
+        "vitamins": vitamins,
         "vit_a": vit_a,
         "vit_c": vit_c,
         "zinc": zinc,

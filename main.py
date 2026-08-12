@@ -454,7 +454,7 @@ def analyze_image(image_bytes, mime_type):
         '  "fat": 15,\n'
         '  "carbs": 80,\n'
         '  "fiber": 3,\n'
-        '  "vitamin": 5,\n'
+        '  "vitamins": 5,\n'
         '  "vit_a": 80,\n'
         '  "vit_c": 15,\n'
         '  "zinc": 1.5,\n'
@@ -495,7 +495,7 @@ def analyze_image(image_bytes, mime_type):
 #  微量栄養素はGeminiが省略することがあるため、必須項目には含めず、
 # 数値変換に失敗した場合や欠けている場合は0として扱う。
 MICRONUTRIENT_KEYS = (
-    "fiber", "vitamin", "vit_a", "vit_c", "zinc", "magnesium", "iron", "potassium", "calcium",
+    "fiber", "vitamins", "vit_a", "vit_c", "zinc", "magnesium", "iron", "potassium", "calcium",
 )
 
 
@@ -546,7 +546,7 @@ def re_analyze_meal(previous_menu, correction_text):
         '  "fat": 15,\n'
         '  "carbs": 80,\n'
         '  "fiber": 3,\n'
-        '  "vitamin": 5,\n'
+        '  "vitamins": 5,\n'
         '  "vit_a": 80,\n'
         '  "vit_c": 15,\n'
         '  "zinc": 1.5,\n'
