@@ -5,6 +5,7 @@ import os
 import asyncio
 import base64
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -439,9 +440,82 @@ def fetch_line_image(message_id):
         raise RuntimeError("LINEから画像を取得できませんでした。") from exc
 
 
+GEMINI_MAX_RETRIES = 2  # 503（Google側の一時的な過負荷）のときだけ、1モデルあたりこの回数までリトライする
+
+
+class GeminiOverloadedError(RuntimeError):
+    """Geminiが503（過負荷）を返し続け、リトライしても回復しなかったことを表す。
+
+    503以外のエラー（キー不正・不正なリクエストなど）とは区別し、
+    このエラーのときだけ次の候補モデルへフォールバックする。
+    """
+
+
+def _gemini_url(model):
+    encoded_key = urllib.parse.quote(GEMINI_API_KEY or "", safe="")
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={encoded_key}"
+
+
+def _gemini_models_to_try():
+    """試すモデルの候補リストを作る。
+
+    GEMINI_MODEL が本命。GEMINI_FALLBACK_MODELS（カンマ区切り、例:
+    "gemini-2.5-flash,gemini-2.5-flash-lite"）を設定しておくと、
+    本命モデルが503で全滅したときだけ順番に次を試す。
+    未設定なら本命モデルだけを使う（フォールバックなし＝これまでと同じ挙動）。
+    """
+    primary = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+    fallbacks = [m.strip() for m in os.environ.get("GEMINI_FALLBACK_MODELS", "").split(",") if m.strip()]
+    models = [primary] + [m for m in fallbacks if m != primary]
+    return models
+
+
+def call_gemini_with_retry(url, payload, action_label, timeout=30, max_retries=GEMINI_MAX_RETRIES):
+    """GeminiへPOSTし、503（サービス一時利用不可）のときだけ待機して再試行する。
+
+    リトライを使い切ってもなお503の場合は GeminiOverloadedError を送出する。
+    503以外のHTTPエラーや通信エラーは、これまで通り即座にRuntimeErrorとして扱う。
+    action_label には「解析」「再計算」など、エラーメッセージに使う言葉を渡す。
+    """
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    for attempt in range(max_retries):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 503:
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** (attempt + 1))  # 2秒→4秒と待機時間を伸ばしながら再試行
+                    continue
+                raise GeminiOverloadedError(f"Geminiの{action_label}に失敗しました（HTTP 503）。") from exc
+            raise RuntimeError(f"Geminiの{action_label}に失敗しました（HTTP {exc.code}）。") from exc
+        except (urllib.error.URLError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Geminiの{action_label}結果を受け取れませんでした。") from exc
+
+
+def generate_content_with_fallback(payload, action_label, timeout=30):
+    """本命モデルが503で全滅したときだけ、次の候補モデルへ切り替えて試す。
+
+    503以外のエラーはフォールバックせず、その場で送出する
+    （キー不正などをフォールバックで隠してしまわないため）。
+    """
+    last_error = None
+    for model in _gemini_models_to_try():
+        try:
+            return call_gemini_with_retry(_gemini_url(model), payload, action_label, timeout=timeout)
+        except GeminiOverloadedError as exc:
+            last_error = exc
+            continue
+    raise last_error
+
+
 def analyze_image(image_bytes, mime_type):
     """Geminiへ食事写真を渡し、保存できる形の結果だけを返す。"""
-    model = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
     prompt = (
         "この画像に写っている食事を解析してください。\n"
         "推定される料理名、おおよそのカロリー（kcal）、PFCバランス（g）、"
@@ -473,21 +547,7 @@ def analyze_image(image_bytes, mime_type):
         ]}],
         "generationConfig": {"responseMimeType": "application/json"},
     }
-    encoded_key = urllib.parse.quote(GEMINI_API_KEY or "", safe="")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={encoded_key}"
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            response_json = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Geminiの解析に失敗しました（HTTP {exc.code}）。") from exc
-    except (urllib.error.URLError, json.JSONDecodeError) as exc:
-        raise RuntimeError("Geminiの解析結果を受け取れませんでした。") from exc
+    response_json = generate_content_with_fallback(payload, "解析", timeout=30)
 
     return parse_analysis_result(response_json)
 
@@ -532,7 +592,6 @@ def parse_analysis_result(response_json):
 
 def re_analyze_meal(previous_menu, correction_text):
     """ユーザーの補足を使い、直前の食事をもう一度計算する。"""
-    model = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
     prompt = (
         f"直前の判定メニュー: 「{previous_menu}」\n"
         f"ユーザーからの修正・補足入力: 「{correction_text}」\n\n"
@@ -558,21 +617,9 @@ def re_analyze_meal(previous_menu, correction_text):
         "}"
         + MEDICAL_GUARDRAIL
     )
-    encoded_key = urllib.parse.quote(GEMINI_API_KEY or "", safe="")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={encoded_key}"
-    request = urllib.request.Request(
-        url,
-        data=json.dumps({"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}}).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return parse_analysis_result(json.loads(response.read().decode("utf-8")))
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Geminiの再計算に失敗しました（HTTP {exc.code}）。") from exc
-    except (urllib.error.URLError, json.JSONDecodeError) as exc:
-        raise RuntimeError("Geminiの再計算結果を受け取れませんでした。") from exc
+    payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}}
+    response_json = generate_content_with_fallback(payload, "再計算", timeout=30)
+    return parse_analysis_result(response_json)
 
 
 def correct_last_meal(user_id, user, correction_text):
