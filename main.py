@@ -463,22 +463,31 @@ def _gemini_models_to_try():
     "gemini-2.5-flash,gemini-2.5-flash-lite"）を設定しておくと、
     本命モデルが503で全滅したときだけ順番に次を試す。
     未設定なら本命モデルだけを使う（フォールバックなし＝これまでと同じ挙動）。
+
+    環境変数にありがちな引用符・前後の空白・改行は、ここで取り除いておく
+    （Renderの入力欄に "gemini-2.5-flash" のように引用符ごと貼り付けてしまうと、
+    そのままではAPIが404を返すため）。
     """
-    primary = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
-    fallbacks = [m.strip() for m in os.environ.get("GEMINI_FALLBACK_MODELS", "").split(",") if m.strip()]
+    def _clean(value):
+        return value.strip().strip('"').strip("'").strip()
+
+    primary = _clean(os.environ.get("GEMINI_MODEL", "gemini-flash-latest"))
+    fallbacks = [_clean(m) for m in os.environ.get("GEMINI_FALLBACK_MODELS", "").split(",") if _clean(m)]
     models = [primary] + [m for m in fallbacks if m != primary]
     return models
 
 
-def call_gemini_with_retry(url, payload, action_label, timeout=30, max_retries=GEMINI_MAX_RETRIES):
+def call_gemini_with_retry(model, payload, action_label, timeout=30, max_retries=GEMINI_MAX_RETRIES):
     """GeminiへPOSTし、503（サービス一時利用不可）のときだけ待機して再試行する。
 
     リトライを使い切ってもなお503の場合は GeminiOverloadedError を送出する。
     503以外のHTTPエラーや通信エラーは、これまで通り即座にRuntimeErrorとして扱う。
     action_label には「解析」「再計算」など、エラーメッセージに使う言葉を渡す。
+    エラーメッセージには、どのモデル名でリクエストしたかを必ず含める
+    （404などが出たとき、原因のモデル名をログだけで特定できるようにするため）。
     """
     request = urllib.request.Request(
-        url,
+        _gemini_url(model),
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -492,10 +501,10 @@ def call_gemini_with_retry(url, payload, action_label, timeout=30, max_retries=G
                 if attempt < max_retries - 1:
                     time.sleep(2 ** (attempt + 1))  # 2秒→4秒と待機時間を伸ばしながら再試行
                     continue
-                raise GeminiOverloadedError(f"Geminiの{action_label}に失敗しました（HTTP 503）。") from exc
-            raise RuntimeError(f"Geminiの{action_label}に失敗しました（HTTP {exc.code}）。") from exc
+                raise GeminiOverloadedError(f"Geminiの{action_label}に失敗しました（モデル: {model}、HTTP 503）。") from exc
+            raise RuntimeError(f"Geminiの{action_label}に失敗しました（モデル: {model}、HTTP {exc.code}）。") from exc
         except (urllib.error.URLError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Geminiの{action_label}結果を受け取れませんでした。") from exc
+            raise RuntimeError(f"Geminiの{action_label}結果を受け取れませんでした（モデル: {model}）。") from exc
 
 
 def generate_content_with_fallback(payload, action_label, timeout=30):
@@ -507,7 +516,7 @@ def generate_content_with_fallback(payload, action_label, timeout=30):
     last_error = None
     for model in _gemini_models_to_try():
         try:
-            return call_gemini_with_retry(_gemini_url(model), payload, action_label, timeout=timeout)
+            return call_gemini_with_retry(model, payload, action_label, timeout=timeout)
         except GeminiOverloadedError as exc:
             last_error = exc
             continue
