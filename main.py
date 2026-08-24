@@ -443,12 +443,17 @@ def fetch_line_image(message_id):
 GEMINI_MAX_RETRIES = 2  # 503（Google側の一時的な過負荷）のときだけ、1モデルあたりこの回数までリトライする
 
 
-class GeminiOverloadedError(RuntimeError):
-    """Geminiが503（過負荷）を返し続け、リトライしても回復しなかったことを表す。
+class GeminiModelUnavailableError(RuntimeError):
+    """特定のモデルが今回使えなかったことを表す（503のリトライ上限到達、または404）。
 
-    503以外のエラー（キー不正・不正なリクエストなど）とは区別し、
     このエラーのときだけ次の候補モデルへフォールバックする。
+    それ以外のエラー（キー不正・不正なリクエストなど）はフォールバックせず、その場で失敗として扱う。
     """
+
+    def __init__(self, model, reason):
+        self.model = model
+        self.reason = reason
+        super().__init__(f"モデル「{model}」が利用できませんでした（{reason}）。")
 
 
 def _gemini_url(model):
@@ -460,8 +465,8 @@ def _gemini_models_to_try():
     """試すモデルの候補リストを作る。
 
     GEMINI_MODEL が本命。GEMINI_FALLBACK_MODELS（カンマ区切り、例:
-    "gemini-2.5-flash,gemini-2.5-flash-lite"）を設定しておくと、
-    本命モデルが503で全滅したときだけ順番に次を試す。
+    "gemini-3.5-flash-lite,gemini-3.5-flash,gemini-3.6-flash"）を設定しておくと、
+    本命モデルが使えなかったときだけ順番に次を試す。
     未設定なら本命モデルだけを使う（フォールバックなし＝これまでと同じ挙動）。
 
     環境変数にありがちな引用符・前後の空白・改行は、ここで取り除いておく
@@ -478,13 +483,15 @@ def _gemini_models_to_try():
 
 
 def call_gemini_with_retry(model, payload, action_label, timeout=30, max_retries=GEMINI_MAX_RETRIES):
-    """GeminiへPOSTし、503（サービス一時利用不可）のときだけ待機して再試行する。
+    """Geminiへ1つのモデルでPOSTする。
 
-    リトライを使い切ってもなお503の場合は GeminiOverloadedError を送出する。
-    503以外のHTTPエラーや通信エラーは、これまで通り即座にRuntimeErrorとして扱う。
+    - 503（一時的な過負荷）のときだけ待機してリトライする。リトライを使い切ってもなお503なら
+      GeminiModelUnavailableError を送出し、フォールバック対象にする。
+    - 404（モデルが存在しない・使えない）はリトライしても直らないため、即座に
+      GeminiModelUnavailableError を送出し、フォールバック対象にする。
+    - それ以外のHTTPエラーや通信エラーは、これまで通り即座にRuntimeErrorとして扱う
+      （キー不正などをフォールバックで隠してしまわないため）。
     action_label には「解析」「再計算」など、エラーメッセージに使う言葉を渡す。
-    エラーメッセージには、どのモデル名でリクエストしたかを必ず含める
-    （404などが出たとき、原因のモデル名をログだけで特定できるようにするため）。
     """
     request = urllib.request.Request(
         _gemini_url(model),
@@ -501,26 +508,50 @@ def call_gemini_with_retry(model, payload, action_label, timeout=30, max_retries
                 if attempt < max_retries - 1:
                     time.sleep(2 ** (attempt + 1))  # 2秒→4秒と待機時間を伸ばしながら再試行
                     continue
-                raise GeminiOverloadedError(f"Geminiの{action_label}に失敗しました（モデル: {model}、HTTP 503）。") from exc
+                raise GeminiModelUnavailableError(model, "HTTP 503：リトライ上限に到達") from exc
+            if exc.code == 404:
+                raise GeminiModelUnavailableError(model, "HTTP 404：モデルが見つからない、または使用不可") from exc
             raise RuntimeError(f"Geminiの{action_label}に失敗しました（モデル: {model}、HTTP {exc.code}）。") from exc
         except (urllib.error.URLError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"Geminiの{action_label}結果を受け取れませんでした（モデル: {model}）。") from exc
 
 
 def generate_content_with_fallback(payload, action_label, timeout=30):
-    """本命モデルが503で全滅したときだけ、次の候補モデルへ切り替えて試す。
+    """本命モデルが使えなかったときだけ、次の候補モデルへ切り替えて解析を完走させる。
 
-    503以外のエラーはフォールバックせず、その場で送出する
-    （キー不正などをフォールバックで隠してしまわないため）。
+    戻り値は (response_json, fallback_notice)。
+    fallback_notice は、切り替えが一度も発生しなかった場合は None、
+    発生した場合は「どのモデルがどう失敗し、最終的にどのモデルで成功したか」を表す文字列。
+    503/404以外のエラーはフォールバックせず、その場で送出する。
     """
-    last_error = None
+    attempts = []  # [(model, "成功" または失敗理由), ...]
     for model in _gemini_models_to_try():
         try:
-            return call_gemini_with_retry(model, payload, action_label, timeout=timeout)
-        except GeminiOverloadedError as exc:
-            last_error = exc
+            response_json = call_gemini_with_retry(model, payload, action_label, timeout=timeout)
+            attempts.append((model, "成功"))
+            notice = None
+            if len(attempts) > 1:
+                history = " → ".join(f"{m}:{status}" for m, status in attempts)
+                notice = (
+                    f"Gemini{action_label}でモデルのフォールバックが発生しました（{history}）。"
+                    f"最終的に「{model}」で解析が完了し、結果をユーザーへ通知しました。"
+                )
+            return response_json, notice
+        except GeminiModelUnavailableError as exc:
+            attempts.append((model, exc.reason))
             continue
-    raise last_error
+    history = " → ".join(f"{m}:{status}" for m, status in attempts)
+    raise RuntimeError(f"Geminiの{action_label}に失敗しました。試した全モデルが利用できませんでした（{history}）。")
+
+
+def _log_fallback_notice_if_any(user_id, result):
+    """フォールバックが発生していた場合、その経緯をエラーログへ記録する（失敗ではなく経過報告として）。"""
+    notice = result.pop("_gemini_fallback_notice", None)
+    if notice:
+        try:
+            sheets.save_error_log(user_id, "gemini_fallback_notice", notice)
+        except Exception:
+            pass
 
 
 def analyze_image(image_bytes, mime_type):
@@ -556,9 +587,12 @@ def analyze_image(image_bytes, mime_type):
         ]}],
         "generationConfig": {"responseMimeType": "application/json"},
     }
-    response_json = generate_content_with_fallback(payload, "解析", timeout=30)
+    response_json, fallback_notice = generate_content_with_fallback(payload, "解析", timeout=30)
 
-    return parse_analysis_result(response_json)
+    result = parse_analysis_result(response_json)
+    if fallback_notice:
+        result["_gemini_fallback_notice"] = fallback_notice
+    return result
 
 
 #  微量栄養素はGeminiが省略することがあるため、必須項目には含めず、
@@ -627,8 +661,11 @@ def re_analyze_meal(previous_menu, correction_text):
         + MEDICAL_GUARDRAIL
     )
     payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}}
-    response_json = generate_content_with_fallback(payload, "再計算", timeout=30)
-    return parse_analysis_result(response_json)
+    response_json, fallback_notice = generate_content_with_fallback(payload, "再計算", timeout=30)
+    result = parse_analysis_result(response_json)
+    if fallback_notice:
+        result["_gemini_fallback_notice"] = fallback_notice
+    return result
 
 
 def correct_last_meal(user_id, user, correction_text):
@@ -639,6 +676,7 @@ def correct_last_meal(user_id, user, correction_text):
         return "修正する食事記録が見つかりませんでした。食事写真を送ってください。"
     _, log = last_log
     result = re_analyze_meal(log.get("menu_name") or "", correction_text)
+    _log_fallback_notice_if_any(user_id, result)
     sheets.update_last_log(
         user_id,
         result["menu_name"],
@@ -667,6 +705,7 @@ def correct_last_meal(user_id, user, correction_text):
 
 def save_analysis_and_build_message(user_id, user, result):
     """解析結果をログへ保存し、ユーザーに返す文章を組み立てる。"""
+    _log_fallback_notice_if_any(user_id, result)
     user_name = user.get("user_name") or "ユーザー"
     sheets.save_log(user_id, user_name, advice=result["suggestion"], **{
         key: result[key] for key in ("menu_name", "calories", "protein", "fat", "carbs")
