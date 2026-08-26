@@ -809,7 +809,7 @@ def fetch_line_image(message_id):
         with urllib.request.urlopen(request, timeout=20) as response:
             mime_type = response.headers.get_content_type() or "image/jpeg"
             return response.read(), mime_type
-    except TimeoutError as exc: # ← 追加
+    except TimeoutError as exc:
         raise RuntimeError("LINEから画像を取得する際にタイムアウトしました。") from exc
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"LINEから画像を取得できませんでした（HTTP {exc.code}）。") from exc
@@ -1130,6 +1130,7 @@ async def process_image_event(event):
     user_id = event.source.user_id
     reply_token = event.reply_token
     user = await asyncio.to_thread(sheets.get_user, user_id)
+    
     if user is None or user.get("status") not in ("completed", "awaiting_correction"):
         await asyncio.to_thread(
             send_reply_sync,
@@ -1137,16 +1138,20 @@ async def process_image_event(event):
             "初期設定がまだ完了していません。「リセット」と送って設定を始めてください。",
         )
         return
+        
     await asyncio.to_thread(show_loading_sync, user_id, 15)
+    
     async def get_and_analyze():
         image_bytes, mime_type = await asyncio.to_thread(fetch_line_image, event.message.id)
-        # 【修正】user_idを渡す
         return await asyncio.to_thread(analyze_image, image_bytes, mime_type, user_id)
+        
     task = asyncio.create_task(get_and_analyze())
     try:
+        
         result = await asyncio.wait_for(asyncio.shield(task), timeout=15)
         message = await asyncio.to_thread(save_analysis_and_build_message, user_id, user, result)
         await asyncio.to_thread(send_reply_with_quick_replies_sync, reply_token, message)
+        
     except asyncio.TimeoutError:
         await asyncio.to_thread(
             send_reply_sync,
@@ -1168,76 +1173,25 @@ async def process_image_event(event):
                 user_id,
                 "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
             )
+            
     except Exception as exc:
+        # 【修正】スタックトレースを含めてログに記録
+        error_detail = f"{str(exc)}\n\n--- Stack Trace ---\n{traceback.format_exc()}"
         try:
-            await asyncio.to_thread(sheets.save_error_log, user_id, "process_image_event", str(exc))
+            await asyncio.to_thread(sheets.save_error_log, user_id, "process_image_event", error_detail)
         except Exception:
             pass
-        # 【修正】reply_tokenが有効か確認し、無効ならPushで送信
+            
+        # reply_tokenが無効な場合を考慮してPushにもフォールバック
         try:
-            await asyncio.to_thread(send_reply_sync, reply_token, "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。")
+            await asyncio.to_thread(
+                send_reply_sync, 
+                reply_token, 
+                "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。"
+            )
         except Exception:
             await asyncio.to_thread(
                 send_push_sync,
                 user_id,
-                "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
-            )
-    user_id = event.source.user_id
-    reply_token = event.reply_token
-    user = await asyncio.to_thread(sheets.get_user, user_id)
-    
-    if user is None or user.get("status") not in ("completed", "awaiting_correction"):
-        await asyncio.to_thread(
-            send_reply_sync,
-            reply_token,
-            "初期設定がまだ完了していません。「リセット」と送って設定を始めてください。",
-        )
-        return
-    
-    await asyncio.to_thread(show_loading_sync, user_id, 15)
-    
-    async def get_and_analyze():
-        image_bytes, mime_type = await asyncio.to_thread(fetch_line_image, event.message.id)
-        return await asyncio.to_thread(analyze_image, image_bytes, mime_type)
-    
-    task = asyncio.create_task(get_and_analyze())
-    try:
-        result = await asyncio.wait_for(asyncio.shield(task), timeout=15)
-        message = await asyncio.to_thread(save_analysis_and_build_message, user_id, user, result)
-        await asyncio.to_thread(send_reply_with_quick_replies_sync, reply_token, message)
-    except asyncio.TimeoutError:
-        await asyncio.to_thread(
-            send_reply_sync,
-            reply_token,
-            " ただいま写真を解析しています。終わり次第、こちらへお知らせします。",
-        )
-        try:
-            result = await task
-            message = await asyncio.to_thread(save_analysis_and_build_message, user_id, user, result)
-            await asyncio.to_thread(send_push_sync, user_id, message)
-            await asyncio.to_thread(sheets.save_push_log, user_id, "画像解析の結果通知")
-        except Exception as exc:
-            try:
-                await asyncio.to_thread(sheets.save_error_log, user_id, "process_image_event", str(exc))
-            except Exception:
-                pass
-            await asyncio.to_thread(
-                send_push_sync,
-                user_id,
-                "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
-            )
-    except Exception as exc:
-        try:
-            await asyncio.to_thread(sheets.save_error_log, user_id, "process_image_event", str(exc))
-        except Exception:
-            # 【重要】スタックトレースを含めてログに記録
-            error_detail = f"{str(exc)}\n\n--- Stack Trace ---\n{traceback.format_exc()}"
-            try:
-                await asyncio.to_thread(sheets.save_error_log, user_id, "process_image_event", error_detail)
-            except Exception:
-                pass
-            await asyncio.to_thread(
-                send_reply_sync,
-                reply_token,
                 "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
             )
