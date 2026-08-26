@@ -854,13 +854,10 @@ def _gemini_models_to_try():
 
 def call_gemini_with_retry(model, payload, action_label, timeout=30, max_retries=GEMINI_MAX_RETRIES):
     """Geminiへ1つのモデルでPOSTする。
-    - 503（一時的な過負荷）のときだけ待機してリトライする。リトライを使い切ってもなお503なら
-       GeminiModelUnavailableError を送出し、フォールバック対象にする。
-     - 404（モデルが存在しない・使えない）はリトライしても直らないため、即座に
-       GeminiModelUnavailableError を送出し、フォールバック対象にする。
-     - それ以外のHTTPエラーや通信エラーは、これまで通り即座にRuntimeErrorとして扱う
-       （キー不正などをフォールバックで隠してしまわないため）。
-     action_label には「解析」「再計算」など、エラーメッセージに使う言葉を渡す。
+    - 503（一時的な過負荷）のときだけ待機してリトライする。
+    - 404（モデルが存在しない・使えない）は即座にGeminiModelUnavailableErrorを送出。
+    - 400（APIキー不正など）もGeminiModelUnavailableErrorを送出（Groqフォールバック用）。
+    - それ以外のHTTPエラーや通信エラーは、RuntimeErrorとして扱う。
     """
     request = urllib.request.Request(
         _gemini_url(model),
@@ -880,9 +877,12 @@ def call_gemini_with_retry(model, payload, action_label, timeout=30, max_retries
                 raise GeminiModelUnavailableError(model, "HTTP 503：リトライ上限に到達") from exc
             if exc.code == 404:
                 raise GeminiModelUnavailableError(model, "HTTP 404：モデルが見つからない、または使用不可") from exc
+            # 【修正】HTTP 400もGeminiModelUnavailableErrorとして扱う（Groqフォールバック用）
+            if exc.code == 400:
+                raise GeminiModelUnavailableError(model, f"HTTP 400：リクエスト不正（APIキー不正の可能性）") from exc
             raise RuntimeError(f"Geminiの{action_label}に失敗しました（モデル: {model}、HTTP {exc.code}）。") from exc
-        except TimeoutError as exc: # ← 追加
-            raise RuntimeError(f"Geminiの{action_label}でタイムアウトしました（モデル: {model}）。") from exc
+        except TimeoutError as exc:  # 【追加】タイムアウトエラーも捕捉
+            raise GeminiModelUnavailableError(model, "タイムアウト") from exc
         except (urllib.error.URLError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"Geminiの{action_label}結果を受け取れませんでした（モデル: {model}）。") from exc
 
@@ -948,7 +948,6 @@ def call_groq_vision(image_bytes, mime_type):
 def generate_content_with_fallback(payload, action_label, timeout=30, image_bytes=None, mime_type=None):
     """本命モデルが使えなかったときだけ、次の候補モデルへ切り替えて解析を完走させる。
     画像解析の場合、Geminiが全滅したらGroq Visionへフォールバックする。
-    戻り値は (response_json, fallback_notice)。
     """
     attempts = []  # [(model, "成功" または失敗理由), ...]
     
@@ -973,21 +972,19 @@ def generate_content_with_fallback(payload, action_label, timeout=30, image_byte
     # 画像解析（image_bytesがある）の場合のみ、Groq Visionへフォールバックする
     if image_bytes and mime_type:
         try:
-            # Groqはpayload形式が異なるため、専用関数を呼ぶ
             groq_result = call_groq_vision(image_bytes, mime_type)
             attempts.append(("Groq-Vision", "成功"))
             history = " → ".join(f"{m}:{status}" for m, status in attempts)
             notice = f"Geminiが全滅したため、Groq Visionで{action_label}を完了しました（{history}）。"
             return groq_result, notice
         except Exception as exc:
-            # Groqも失敗したらエラーログに残す
             try:
                 sheets.save_error_log(None, "groq_fallback_failed", str(exc))
             except Exception:
                 pass
             raise RuntimeError(f"GeminiとGroqの両方で{action_label}に失敗しました。") from exc
 
-    # 画像解析以外（テキストなど）でGeminiが全滅したら、ここでエラーを上げる
+    # 画像解析以外でGeminiが全滅したら、ここでエラーを上げる
     history = " → ".join(f"{m}:{status}" for m, status in attempts)
     raise RuntimeError(f"Geminiの{action_label}に失敗しました。試した全モデルが利用できませんでした（{history}）。")
 
@@ -1038,25 +1035,25 @@ def analyze_image(image_bytes, mime_type):
     """Geminiへ食事写真を渡し、保存できる形の結果だけを返す。"""
     prompt = (
         "この画像に写っている食事を解析してください。\n"
-        "推定される料理名、おおよそのカロリー（kcal）、PFCバランス（g）、 "
+        "推定される料理名、おおよそのカロリー（kcal）、PFCバランス（g）、  "
         "微量栄養素の推定値、次にとるべき食事のアドバイスを、次のJSON形式のみで返してください。\n"
         "微量栄養素はすべて推定値で構いません。数値のみ（単位は付けない）で返してください。\n\n"
         "{\n"
-        '   "menu_name": "料理名",\n'
-        '   "calories": 600,\n'
-        '   "protein": 20,\n'
-        '   "fat": 15,\n'
-        '   "carbs": 80,\n'
-        '   "fiber": 3,\n'
-        '   "vitamins": 5,\n'
-        '   "vit_a": 80,\n'
-        '   "vit_c": 15,\n'
-        '   "zinc": 1.5,\n'
-        '   "magnesium": 40,\n'
-        '   "iron": 1.2,\n'
-        '   "potassium": 400,\n'
-        '   "calcium": 60,\n'
-        '   "suggestion": "アドバイスメッセージ"\n'
+        '    "menu_name": "料理名",\n'
+        '    "calories": 600,\n'
+        '    "protein": 20,\n'
+        '    "fat": 15,\n'
+        '    "carbs": 80,\n'
+        '    "fiber": 3,\n'
+        '    "vitamins": 5,\n'
+        '    "vit_a": 80,\n'
+        '    "vit_c": 15,\n'
+        '    "zinc": 1.5,\n'
+        '    "magnesium": 40,\n'
+        '    "iron": 1.2,\n'
+        '    "potassium": 400,\n'
+        '    "calcium": 60,\n'
+        '    "suggestion": "アドバイスメッセージ"\n'
         "}"
         + MEDICAL_GUARDRAIL
     )
@@ -1067,8 +1064,7 @@ def analyze_image(image_bytes, mime_type):
         ]}],
         "generationConfig": {"responseMimeType": "application/json"},
     }
-    
-    # image_bytesとmime_typeを引数に追加して渡す
+    # 【修正】image_bytesとmime_typeを引数に追加して渡す
     response_json, fallback_notice = generate_content_with_fallback(
         payload, 
         "解析", 
@@ -1076,7 +1072,6 @@ def analyze_image(image_bytes, mime_type):
         image_bytes=image_bytes,  # ← 追加
         mime_type=mime_type       # ← 追加
     )
-    
     result = parse_analysis_result(response_json)
     if fallback_notice:
         result["_gemini_fallback_notice"] = fallback_notice
