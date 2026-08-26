@@ -22,6 +22,16 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import FollowEvent, ImageMessageContent, MessageEvent, TextMessageContent
 import sheets
 
+import logging
+import traceback
+
+# ロギングの設定（Renderのログ出力用）
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
+
 app = FastAPI()
 
 # 環境変数
@@ -514,10 +524,14 @@ def parse_text_intent_result(response_json: dict, *, allow_correction: bool) -> 
         
         intent = data.get("intent", "chat")
         
-        # 【優先3修正】intentのホワイトリスト検証
+        # 【重要】intentのホワイトリスト検証
         ALLOWED_INTENTS = {"chat", "meal_add", "meal_correction"}
         if intent not in ALLOWED_INTENTS:
-            raise RuntimeError(f"不正なintentが返されました: {intent}")
+            # 不正なintentは安全側に倒してchatとして処理
+            return {
+                "type": "chat",
+                "reply": "すみません、うまく理解できませんでした。食事の記録や相談ならお手伝いできますよ！"
+            }
         
         if intent == "chat":
             return {
@@ -530,7 +544,7 @@ def parse_text_intent_result(response_json: dict, *, allow_correction: bool) -> 
         if not required.issubset(data):
             raise ValueError("食事データに必要な項目がありません")
         
-        # コード側の最終ガード：許可されていないのにmeal_correctionが来たら安全側でmeal_addに倒す
+        # コード側の最終ガード：許可されていないのにmeal_correctionが来たらmeal_addに倒す
         if intent == "meal_correction" and not allow_correction:
             intent = "meal_add"
         
@@ -543,37 +557,62 @@ def parse_text_intent_result(response_json: dict, *, allow_correction: bool) -> 
             "carbs": round(float(data["carbs"]), 1),
             "suggestion": str(data["suggestion"]).strip(),
         }
-        
         for key in MICRONUTRIENT_KEYS:
             result[key] = _number_or_zero(data.get(key))
-        
         return result
+        
     except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise RuntimeError("Geminiのテキスト解析結果の形式が正しくありませんでした。") from exc
+        # パースエラー時は安全側に倒して雑談として処理
+        return {
+            "type": "chat",
+            "reply": "申し訳ありません。処理中に問題が発生しました。もう一度送っていただけますか？"
+        }
 
 def _deliver_text_analysis_result(reply_token, user_id, user, result, *, is_push):
     """Geminiのテキスト解析結果（食事 or 雑談）を保存し、Reply/Pushいずれかで届ける。"""
-    _log_fallback_notice_if_any(user_id, result)
-    
-    intent = result["type"]
-    today_logs_before = result.pop("_today_logs_before", None)
-    
-    if intent == "chat":
-        message = result["reply"]
-        (send_push_sync if is_push else send_reply_sync)(
-            user_id if is_push else reply_token, message
-        )
-        return
-    
-    if intent == "meal_correction":
-        message = _apply_meal_correction(user_id, user, result)
-    else:  # meal_add
-        message = _apply_meal_add(user_id, user, result, today_logs_before)
-    
-    if is_push:
-        send_push_sync(user_id, message)
-    else:
-        send_reply_with_quick_replies_sync(reply_token, message)
+    try:
+        _log_fallback_notice_if_any(user_id, result)
+        intent = result["type"]
+        today_logs_before = result.pop("_today_logs_before", None)
+        
+        if intent == "chat":
+            message = result["reply"]
+            if is_push:
+                send_push_sync(user_id, message)
+            elif reply_token:
+                send_reply_sync(reply_token, message)
+            else:
+                # reply_tokenもis_pushもない場合はPushで送信
+                send_push_sync(user_id, message)
+                sheets.save_error_log(user_id, "_deliver_text_analysis_result", 
+                                    "reply_tokenがなく、is_push=Falseでした。Pushにフォールバック")
+            return
+            
+        if intent == "meal_correction":
+            message = _apply_meal_correction(user_id, user, result)
+        else:  # meal_add
+            message = _apply_meal_add(user_id, user, result, today_logs_before)
+        
+        if is_push:
+            send_push_sync(user_id, message)
+        elif reply_token:
+            send_reply_with_quick_replies_sync(reply_token, message)
+        else:
+            # reply_tokenが切れている場合はPushで送信
+            send_push_sync(user_id, message)
+            sheets.save_error_log(user_id, "_deliver_text_analysis_result", 
+                                "reply_tokenがNone/無効のためPushにフォールバック")
+            
+    except Exception as exc:
+        # エラーログを記録
+        try:
+            import traceback
+            error_detail = f"{str(exc)}\n{traceback.format_exc()}"
+            sheets.save_error_log(user_id, "_deliver_text_analysis_result", error_detail)
+        except Exception:
+            pass
+        # ーザーに通知（Pushが安全）
+        send_push_sync(user_id, "処理中に問題が発生しました。恐れ入りますが、もう一度送ってください。")
 
 def _apply_meal_add(user_id, user, result, today_logs_before):
     """新しい食事を記録する。"""
@@ -648,10 +687,7 @@ def _apply_meal_correction(user_id, user, result):
     )
 
 async def process_text_meal_or_chat(event, user_id, user, text):
-    """食事報告/雑談の判定をGeminiに依頼する。
-    画像解析と同じく、一定時間を超えたら「考え中」で先に返信し、
-    リプライトークンが切れる前にユーザーへ何か返すことを優先する。完了したら後追いでPushする。
-    """
+    """食事報告/雑談の判定をGeminiに依頼する。"""
     reply_token = event.reply_token
     last_meal_context = _build_last_meal_context(user)
     
@@ -663,6 +699,7 @@ async def process_text_meal_or_chat(event, user_id, user, text):
         result = await asyncio.wait_for(asyncio.shield(task), timeout=12)
         await asyncio.to_thread(_deliver_text_analysis_result, reply_token, user_id, user, result, is_push=False)
     except asyncio.TimeoutError:
+        logger.warning(f"テキスト解析がタイムアウト: user_id={user_id}, text={text[:50]}")
         await asyncio.to_thread(
             send_reply_sync,
             reply_token,
@@ -673,8 +710,10 @@ async def process_text_meal_or_chat(event, user_id, user, text):
             await asyncio.to_thread(_deliver_text_analysis_result, None, user_id, user, result, is_push=True)
             await asyncio.to_thread(sheets.save_push_log, user_id, "テキスト解析の結果通知")
         except Exception as exc:
+            error_detail = f"{str(exc)}\n{traceback.format_exc()}"
+            logger.error(f"タイムアウト後の処理でエラー: user_id={user_id}, {error_detail}")
             try:
-                await asyncio.to_thread(sheets.save_error_log, user_id, "process_text_event", str(exc))
+                await asyncio.to_thread(sheets.save_error_log, user_id, "process_text_event(timeout)", error_detail)
             except Exception:
                 pass
             await asyncio.to_thread(
@@ -683,8 +722,10 @@ async def process_text_meal_or_chat(event, user_id, user, text):
                 "処理に失敗しました。恐れ入りますが、もう一度送ってください。",
             )
     except Exception as exc:
+        error_detail = f"{str(exc)}\n{traceback.format_exc()}"
+        logger.error(f"テキスト解析でエラー: user_id={user_id}, text={text[:50]}, {error_detail}")
         try:
-            await asyncio.to_thread(sheets.save_error_log, user_id, "process_text_event", str(exc))
+            await asyncio.to_thread(sheets.save_error_log, user_id, "process_text_event", error_detail)
         except Exception:
             pass
         await asyncio.to_thread(

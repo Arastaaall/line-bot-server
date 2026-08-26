@@ -341,6 +341,26 @@ def save_push_log(user_id: str, reason: str) -> None:
     _append_by_header("push_logs", {"Timestamp": _now(), "User ID": user_id, "Reason": reason})
 
 def save_error_log(user_id: str | None, function_name: str, error_message: str) -> None:
+    """エラーログを保存する（例外を握りつぶさない）"""
+    try:
+        import traceback
+        # エラーメッセージにスタックトレースが含まれていない場合は追加
+        if "Traceback" not in error_message:
+            error_message = f"{error_message}\n{traceback.format_exc()}"
+        
+        _append_by_header(
+            "error_logs",
+            {
+                "timestamp": _now(),
+                "user_id": user_id or "",
+                "function_name": function_name,
+                "error_message": error_message,
+            },
+        )
+    except Exception as e:
+        # Sheetsへの保存自体に失敗した場合は、標準エラー出力に記録
+        print(f"ERROR: save_error_log failed: {e}")
+        print(f"Original error: {error_message}")
     _append_by_header(
         "error_logs",
         {
