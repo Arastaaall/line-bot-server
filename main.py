@@ -913,7 +913,6 @@ def call_groq_vision(image_bytes, mime_type):
         "【注意】\n"
         "- 数値のみで、単位は付けない。\n"
         "- 微量栄養素は推定値で構わない。\n"
-        "- 思考プロセス（<think>タグなど）は出力せず、JSONのみを返す。\n"
     )
     
     try:
@@ -928,27 +927,29 @@ def call_groq_vision(image_bytes, mime_type):
                     ]
                 }
             ],
-            # 【修正】response_formatを削除（Qwenモデルの<think>タグとの競合を避ける）
-            temperature=0.1,
-            max_tokens=512,
+            # 【重要】reasoningを無効化してnon-thinking modeにする
+            reasoning_effort="none",
+            # 【JSON Mode】PlaygroundのJSON Modeに相当
+            response_format={"type": "json_object"},
+            # Playground設定に合わせる
+            temperature=0.6,
+            max_tokens=2048,  # 512→2048に増量（thinkingがない分、JSON生成に全トークンを使える）
             timeout=15
         )
         
-        raw_content = response.choices[0].message.content
+        # JSON Mode + reasoning_effort="none" なので、直接JSONとしてパースできる
+        return json.loads(response.choices[0].message.content)
         
-        # 【修正】<think>タグを除去
+    except json.JSONDecodeError as exc:
+        # 万が一JSONパースに失敗した場合のみ、<think>タグ除去を試みる（フェイルセーフ）
+        raw_content = response.choices[0].message.content
         if "<think>" in raw_content and "</think>" in raw_content:
             raw_content = raw_content.split("</think>", 1)[1].strip()
-        
-        # 【修正】JSON部分を抽出（マークダウンコードブロックが含まれる場合も対応）
         first_brace = raw_content.find("{")
         last_brace = raw_content.rfind("}")
         if first_brace >= 0 and last_brace > first_brace:
             json_str = raw_content[first_brace:last_brace + 1]
             return json.loads(json_str)
-        else:
-            raise RuntimeError(f"Groq Visionの出力からJSONを抽出できませんでした。出力: {raw_content[:200]}")
-    except json.JSONDecodeError as exc:
         raise RuntimeError(f"Groq VisionのJSONパースに失敗しました。詳細: {exc}") from exc
     except Exception as exc:
         raise RuntimeError(f"Groq Visionの解析に失敗しました。詳細: {exc}") from exc
