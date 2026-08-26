@@ -801,6 +801,8 @@ def fetch_line_image(message_id):
         with urllib.request.urlopen(request, timeout=20) as response:
             mime_type = response.headers.get_content_type() or "image/jpeg"
             return response.read(), mime_type
+    except TimeoutError as exc: # ← 追加
+        raise RuntimeError("LINEから画像を取得する際にタイムアウトしました。") from exc
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"LINEから画像を取得できませんでした（HTTP {exc.code}）。") from exc
     except urllib.error.URLError as exc:
@@ -871,6 +873,8 @@ def call_gemini_with_retry(model, payload, action_label, timeout=30, max_retries
             if exc.code == 404:
                 raise GeminiModelUnavailableError(model, "HTTP 404：モデルが見つからない、または使用不可") from exc
             raise RuntimeError(f"Geminiの{action_label}に失敗しました（モデル: {model}、HTTP {exc.code}）。") from exc
+        except TimeoutError as exc: # ← 追加
+            raise RuntimeError(f"Geminiの{action_label}でタイムアウトしました（モデル: {model}）。") from exc
         except (urllib.error.URLError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"Geminiの{action_label}結果を受け取れませんでした（モデル: {model}）。") from exc
 
@@ -1079,9 +1083,14 @@ async def process_image_event(event):
         try:
             await asyncio.to_thread(sheets.save_error_log, user_id, "process_image_event", str(exc))
         except Exception:
-            pass
-        await asyncio.to_thread(
-            send_reply_sync,
-            reply_token,
-            "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
-        )
+            # 【重要】スタックトレースを含めてログに記録
+            error_detail = f"{str(exc)}\n\n--- Stack Trace ---\n{traceback.format_exc()}"
+            try:
+                await asyncio.to_thread(sheets.save_error_log, user_id, "process_image_event", error_detail)
+            except Exception:
+                pass
+            await asyncio.to_thread(
+                send_reply_sync,
+                reply_token,
+                "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
+            )
