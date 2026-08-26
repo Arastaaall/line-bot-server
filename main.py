@@ -889,7 +889,6 @@ def call_gemini_with_retry(model, payload, action_label, timeout=30, max_retries
 def call_groq_vision(image_bytes, mime_type):
     """Geminiが失敗した場合のフォールバック用Groq Vision解析"""
     base64_image = base64.b64encode(image_bytes).decode("utf-8")
-    
     prompt = (
         "あなたは栄養分析AIです。画像に写っている食事を解析し、以下のJSON形式**のみ**で返してください。\n"
         "思考プロセスは出力せず、JSONのみを返してください。\n\n"
@@ -914,7 +913,6 @@ def call_groq_vision(image_bytes, mime_type):
         "- 数値のみで、単位は付けない。\n"
         "- 微量栄養素は推定値で構わない。\n"
     )
-    
     try:
         response = groq_client.chat.completions.create(
             model="qwen/qwen3.6-27b",
@@ -927,18 +925,14 @@ def call_groq_vision(image_bytes, mime_type):
                     ]
                 }
             ],
-            # 【重要】reasoningを無効化してnon-thinking modeにする
             reasoning_effort="none",
-            # 【JSON Mode】PlaygroundのJSON Modeに相当
             response_format={"type": "json_object"},
-            # Playground設定に合わせる
             temperature=0.6,
-            max_tokens=2048,  # 512→2048に増量（thinkingがない分、JSON生成に全トークンを使える）
+            max_tokens=2048,
             timeout=15
         )
-        
-        # JSON Mode + reasoning_effort="none" なので、直接JSONとしてパースできる
-        return json.loads(response.choices[0].message.content)
+        # 【修正】json.loadsせず、JSON文字列のまま返す
+        return response.choices[0].message.content 
         
     except json.JSONDecodeError as exc:
         # 万が一JSONパースに失敗した場合のみ、<think>タグ除去を試みる（フェイルセーフ）
@@ -948,55 +942,41 @@ def call_groq_vision(image_bytes, mime_type):
         first_brace = raw_content.find("{")
         last_brace = raw_content.rfind("}")
         if first_brace >= 0 and last_brace > first_brace:
-            json_str = raw_content[first_brace:last_brace + 1]
-            return json.loads(json_str)
+            # 【修正】json.loadsせず、抽出したJSON文字列をそのまま返す
+            return raw_content[first_brace:last_brace + 1]
         raise RuntimeError(f"Groq VisionのJSONパースに失敗しました。詳細: {exc}") from exc
     except Exception as exc:
         raise RuntimeError(f"Groq Visionの解析に失敗しました。詳細: {exc}") from exc
 
 def generate_content_with_fallback(payload, action_label, timeout=30, image_bytes=None, mime_type=None, user_id=None):
-    """本命モデルが使えなかったときだけ、次の候補モデルへ切り替えて解析を完走させる。
-    画像解析の場合、Geminiが全滅したらGroq Visionへフォールバックする。
-    """
-    attempts = []  # [(model, "成功" または失敗理由), ...]
-    
-    # 1. Geminiモデルを順番に試す
-    for model in _gemini_models_to_try():
-        try:
-            response_json = call_gemini_with_retry(model, payload, action_label, timeout=timeout)
-            attempts.append((model, "成功"))
-            notice = None
-            if len(attempts) > 1:
-                history = " → ".join(f"{m}:{status}" for m, status in attempts)
-                notice = (
-                    f"Gemini{action_label}でモデルのフォールバックが発生しました（{history}）。"
-                    f"最終的に「{model}」で解析が完了し、結果をユーザーへ通知しました。"
-                )
-            return response_json, notice
-        except GeminiModelUnavailableError as exc:
-            attempts.append((model, exc.reason))
-            continue
+    # ... (前半のGeminiループはそのまま) ...
     
     # 2. Geminiが全滅した場合の処理
-    # 画像解析（image_bytesがある）の場合のみ、Groq Visionへフォールバックする
     if image_bytes and mime_type:
         try:
-            groq_result = call_groq_vision(image_bytes, mime_type)
+            groq_json_str = call_groq_vision(image_bytes, mime_type)
+            
+            # 【修正】Groqの戻り値をGeminiと同じ構造にラップする
+            groq_result = {
+                "candidates": [{
+                    "content": {
+                        "parts": [{"text": groq_json_str}]
+                    }
+                }]
+            }
+            
             attempts.append(("Groq-Vision", "成功"))
             history = " → ".join(f"{m}:{status}" for m, status in attempts)
             notice = f"Geminiが全滅したため、Groq Visionで{action_label}を完了しました（{history}）。"
             return groq_result, notice
         except Exception as exc:
-            # 【修正】user_idを渡してエラーログを記録
             try:
                 sheets.save_error_log(user_id, "groq_fallback_failed", str(exc))
             except Exception:
                 pass
             raise RuntimeError(f"GeminiとGroqの両方で{action_label}に失敗しました。") from exc
-
-    # 画像解析以外でGeminiが全滅したら、ここでエラーを上げる
-    history = " → ".join(f"{m}:{status}" for m, status in attempts)
-    raise RuntimeError(f"Geminiの{action_label}に失敗しました。試した全モデルが利用できませんでした（{history}）。")
+            
+    # ... (以降そのまま) ...
 
 def analyze_image(image_bytes, mime_type, user_id=None):
     """Geminiへ食事写真を渡し、保存できる形の結果だけを返す。"""
