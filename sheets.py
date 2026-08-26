@@ -341,13 +341,18 @@ def save_push_log(user_id: str, reason: str) -> None:
     _append_by_header("push_logs", {"Timestamp": _now(), "User ID": user_id, "Reason": reason})
 
 def save_error_log(user_id: str | None, function_name: str, error_message: str) -> None:
-    """エラーログを保存する（例外を握りつぶさない）"""
+    """エラーログを保存する（例外を握りつぶさない）。
+
+    【修正】以前は _append_by_header をtry内と、その直後（try/exceptの外）の
+    計2回呼んでいたため、エラーが起きるたびに同じ行が2行ずつerror_logsシートに
+    書き込まれ、Sheets APIの呼び出し回数も無駄に倍になっていた。1回だけ書き込む。
+    """
     try:
         import traceback
         # エラーメッセージにスタックトレースが含まれていない場合は追加
         if "Traceback" not in error_message:
             error_message = f"{error_message}\n{traceback.format_exc()}"
-        
+
         _append_by_header(
             "error_logs",
             {
@@ -361,12 +366,3 @@ def save_error_log(user_id: str | None, function_name: str, error_message: str) 
         # Sheetsへの保存自体に失敗した場合は、標準エラー出力に記録
         print(f"ERROR: save_error_log failed: {e}")
         print(f"Original error: {error_message}")
-    _append_by_header(
-        "error_logs",
-        {
-            "timestamp": _now(),
-            "user_id": user_id or "",
-            "function_name": function_name,
-            "error_message": error_message,
-        },
-    )

@@ -846,9 +846,17 @@ def _gemini_models_to_try():
     def _clean(value):
         return value.strip().strip('"').strip("'").strip()
     
-    # 【優先7修正】デフォルト値をエイリアス（latest）から固定バージョンに変更
-    primary = _clean(os.environ.get("GEMINI_MODEL", "gemini-2.0-flash"))
-    fallbacks = [_clean(m) for m in os.environ.get("GEMINI_FALLBACK_MODELS", "").split(",") if _clean(m)]
+    # 【修正】gemini-2.0-flashは2026年6月1日付で廃止され、常にHTTP 404になるため、
+    # デフォルトを無料枠のある3.xシリーズ（gemini-3.1-flash-lite）へ変更。
+    # GEMINI_FALLBACK_MODELS未設定でも、無料枠内の複数モデルへ自動で回せるよう
+    # デフォルトのフォールバック列も用意しておく（未設定時のみ使われる）。
+    primary = _clean(os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite"))
+    default_fallbacks = "gemini-3-flash,gemini-3.5-flash-lite"
+    fallbacks = [
+        _clean(m)
+        for m in os.environ.get("GEMINI_FALLBACK_MODELS", default_fallbacks).split(",")
+        if _clean(m)
+    ]
     models = [primary] + [m for m in fallbacks if m != primary]
     return models
 
@@ -875,6 +883,10 @@ def call_gemini_with_retry(model, payload, action_label, timeout=30, max_retries
                     time.sleep(2 ** (attempt + 1))  # 2秒→4秒と待機時間を伸ばしながら再試行
                     continue
                 raise GeminiModelUnavailableError(model, "HTTP 503：リトライ上限に到達") from exc
+            if exc.code == 429:
+                # 無料枠のレート制限。このモデルを待って再試行しても無駄になりやすいので、
+                # 即座に次の候補モデルへ回す（Groqへ行く前にGemini内で吸収する）。
+                raise GeminiModelUnavailableError(model, "HTTP 429：レート制限（無料枠の上限に到達）") from exc
             if exc.code == 404:
                 raise GeminiModelUnavailableError(model, "HTTP 404：モデルが見つからない、または使用不可") from exc
             # 【修正】HTTP 400もGeminiModelUnavailableErrorとして扱う（Groqフォールバック用）
@@ -949,13 +961,40 @@ def call_groq_vision(image_bytes, mime_type):
         raise RuntimeError(f"Groq Visionの解析に失敗しました。詳細: {exc}") from exc
 
 def generate_content_with_fallback(payload, action_label, timeout=30, image_bytes=None, mime_type=None, user_id=None):
-    # ... (前半のGeminiループはそのまま) ...
-    
-    # 2. Geminiが全滅した場合の処理
+    """Geminiの候補モデルを順番に試し、全モデルが利用不可だった場合だけ
+    （画像解析なら）Groq Visionへフォールバックする。
+
+    【重要】以前のバージョンではこの関数の前半（Geminiループと attempts の初期化）が
+    まるごと欠落しており、常にGroqへ直行した上に `attempts` 未定義のNameErrorで
+    そのGroq経路自体も落ちる、という状態になっていた。ここで実装を復元する。
+    """
+    models = _gemini_models_to_try()
+    attempts = []
+    last_exc = None
+
+    # 1. Geminiの候補モデルを順番に試す。
+    #    GeminiModelUnavailableError（503リトライ上限／429レート制限／404／400）のときだけ
+    #    次の候補モデルへ進む。それ以外の例外（通信エラー等のRuntimeError）はここで打ち切る。
+    for model in models:
+        try:
+            response_json = call_gemini_with_retry(model, payload, action_label, timeout=timeout)
+            attempts.append((model, "成功"))
+            notice = None
+            if len(attempts) > 1:
+                # 本命モデルではなく、フォールバック先のモデルで成功した場合だけ通知を付ける。
+                history = " → ".join(f"{m}:{status}" for m, status in attempts)
+                notice = f"本命モデルが使えなかったため、{model}で{action_label}を完了しました（{history}）。"
+            return response_json, notice
+        except GeminiModelUnavailableError as exc:
+            attempts.append((model, exc.reason))
+            last_exc = exc
+            continue
+
+    # 2. Geminiの候補モデルが全滅した場合の処理
     if image_bytes and mime_type:
         try:
             groq_json_str = call_groq_vision(image_bytes, mime_type)
-            
+
             # 【修正】Groqの戻り値をGeminiと同じ構造にラップする
             groq_result = {
                 "candidates": [{
@@ -964,7 +1003,7 @@ def generate_content_with_fallback(payload, action_label, timeout=30, image_byte
                     }
                 }]
             }
-            
+
             attempts.append(("Groq-Vision", "成功"))
             history = " → ".join(f"{m}:{status}" for m, status in attempts)
             notice = f"Geminiが全滅したため、Groq Visionで{action_label}を完了しました（{history}）。"
@@ -975,8 +1014,10 @@ def generate_content_with_fallback(payload, action_label, timeout=30, image_byte
             except Exception:
                 pass
             raise RuntimeError(f"GeminiとGroqの両方で{action_label}に失敗しました。") from exc
-            
-    # ... (以降そのまま) ...
+
+    # 画像がない（テキスト解析）場合はGroqへフォールバックできないため、ここで失敗として伝える。
+    history = " → ".join(f"{m}:{status}" for m, status in attempts) if attempts else "候補モデルなし"
+    raise RuntimeError(f"Geminiの{action_label}に失敗しました（{history}）。") from last_exc
 
 def analyze_image(image_bytes, mime_type, user_id=None):
     """Geminiへ食事写真を渡し、保存できる形の結果だけを返す。"""
