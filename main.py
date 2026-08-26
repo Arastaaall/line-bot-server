@@ -890,7 +890,6 @@ def call_groq_vision(image_bytes, mime_type):
     """Geminiが失敗した場合のフォールバック用Groq Vision解析"""
     base64_image = base64.b64encode(image_bytes).decode("utf-8")
     
-    # Botの要件に合わせたJSON形式を明示
     prompt = (
         "あなたは栄養分析AIです。画像に写っている食事を解析し、以下のJSON形式**のみ**で返してください。\n"
         "思考プロセスは出力せず、JSONのみを返してください。\n\n"
@@ -919,7 +918,7 @@ def call_groq_vision(image_bytes, mime_type):
     
     try:
         response = groq_client.chat.completions.create(
-            model="qwen/qwen3.6-27b",  # テスト成功したモデル
+            model="qwen/qwen3.6-27b",
             messages=[
                 {
                     "role": "user",
@@ -929,7 +928,7 @@ def call_groq_vision(image_bytes, mime_type):
                     ]
                 }
             ],
-            response_format={"type": "json_object"},
+            # 【修正】response_formatを削除（Qwenモデルの<think>タグとの競合を避ける）
             temperature=0.1,
             max_tokens=512,
             timeout=15
@@ -937,15 +936,24 @@ def call_groq_vision(image_bytes, mime_type):
         
         raw_content = response.choices[0].message.content
         
-        # 【重要】<think>...</think> タグを除去
+        # 【修正】<think>タグを除去
         if "<think>" in raw_content and "</think>" in raw_content:
             raw_content = raw_content.split("</think>", 1)[1].strip()
         
-        return json.loads(raw_content)
+        # 【修正】JSON部分を抽出（マークダウンコードブロックが含まれる場合も対応）
+        first_brace = raw_content.find("{")
+        last_brace = raw_content.rfind("}")
+        if first_brace >= 0 and last_brace > first_brace:
+            json_str = raw_content[first_brace:last_brace + 1]
+            return json.loads(json_str)
+        else:
+            raise RuntimeError(f"Groq Visionの出力からJSONを抽出できませんでした。出力: {raw_content[:200]}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Groq VisionのJSONパースに失敗しました。詳細: {exc}") from exc
     except Exception as exc:
         raise RuntimeError(f"Groq Visionの解析に失敗しました。詳細: {exc}") from exc
 
-def generate_content_with_fallback(payload, action_label, timeout=30, image_bytes=None, mime_type=None):
+def generate_content_with_fallback(payload, action_label, timeout=30, image_bytes=None, mime_type=None, user_id=None):
     """本命モデルが使えなかったときだけ、次の候補モデルへ切り替えて解析を完走させる。
     画像解析の場合、Geminiが全滅したらGroq Visionへフォールバックする。
     """
@@ -978,8 +986,9 @@ def generate_content_with_fallback(payload, action_label, timeout=30, image_byte
             notice = f"Geminiが全滅したため、Groq Visionで{action_label}を完了しました（{history}）。"
             return groq_result, notice
         except Exception as exc:
+            # 【修正】user_idを渡してエラーログを記録
             try:
-                sheets.save_error_log(None, "groq_fallback_failed", str(exc))
+                sheets.save_error_log(user_id, "groq_fallback_failed", str(exc))
             except Exception:
                 pass
             raise RuntimeError(f"GeminiとGroqの両方で{action_label}に失敗しました。") from exc
@@ -988,50 +997,7 @@ def generate_content_with_fallback(payload, action_label, timeout=30, image_byte
     history = " → ".join(f"{m}:{status}" for m, status in attempts)
     raise RuntimeError(f"Geminiの{action_label}に失敗しました。試した全モデルが利用できませんでした（{history}）。")
 
-def generate_content_with_fallback(payload, action_label, timeout=30, image_bytes=None, mime_type=None):
-    """本命モデルが使えなかったときだけ、次の候補モデルへ切り替えて解析を完走させる。
-    画像解析の場合、Geminiが全滅したらGroq Visionへフォールバックする。
-    """
-    attempts = []
-    
-    # 1. Geminiモデルを順番に試す
-    for model in _gemini_models_to_try():
-        try:
-            response_json = call_gemini_with_retry(model, payload, action_label, timeout=timeout)
-            attempts.append((model, "成功"))
-            notice = None
-            if len(attempts) > 1:
-                history = " → ".join(f"{m}:{status}" for m, status in attempts)
-                notice = (
-                    f"Gemini{action_label}でモデルのフォールバックが発生しました（{history}）。"
-                    f"最終的に「{model}」で解析が完了し、結果をユーザーへ通知しました。"
-                )
-            return response_json, notice
-        except GeminiModelUnavailableError as exc:
-            attempts.append((model, exc.reason))
-            continue
-    
-    # 2. Geminiが全滅した場合の処理
-    # 画像解析（image_bytesがある）の場合のみ、Groq Visionへフォールバックする
-    if image_bytes and mime_type:
-        try:
-            groq_result = call_groq_vision(image_bytes, mime_type)
-            attempts.append(("Groq-Vision", "成功"))
-            history = " → ".join(f"{m}:{status}" for m, status in attempts)
-            notice = f"Geminiが全滅したため、Groq Visionで{action_label}を完了しました（{history}）。"
-            return groq_result, notice
-        except Exception as exc:
-            try:
-                sheets.save_error_log(None, "groq_fallback_failed", str(exc))
-            except Exception:
-                pass
-            raise RuntimeError(f"GeminiとGroqの両方で{action_label}に失敗しました。") from exc
-
-    # 画像解析以外でGeminiが全滅したら、ここでエラーを上げる
-    history = " → ".join(f"{m}:{status}" for m, status in attempts)
-    raise RuntimeError(f"Geminiの{action_label}に失敗しました。試した全モデルが利用できませんでした（{history}）。")
-
-def analyze_image(image_bytes, mime_type):
+def analyze_image(image_bytes, mime_type, user_id=None):
     """Geminiへ食事写真を渡し、保存できる形の結果だけを返す。"""
     prompt = (
         "この画像に写っている食事を解析してください。\n"
@@ -1064,13 +1030,14 @@ def analyze_image(image_bytes, mime_type):
         ]}],
         "generationConfig": {"responseMimeType": "application/json"},
     }
-    # 【修正】image_bytesとmime_typeを引数に追加して渡す
+    # 【修正】user_idを引数に追加して渡す
     response_json, fallback_notice = generate_content_with_fallback(
         payload, 
         "解析", 
         timeout=30, 
-        image_bytes=image_bytes,  # ← 追加
-        mime_type=mime_type       # ← 追加
+        image_bytes=image_bytes,
+        mime_type=mime_type,
+        user_id=user_id  # ← 追加
     )
     result = parse_analysis_result(response_json)
     if fallback_notice:
@@ -1159,6 +1126,61 @@ async def handle_callback(request: Request):
     return "OK"
 
 async def process_image_event(event):
+    user_id = event.source.user_id
+    reply_token = event.reply_token
+    user = await asyncio.to_thread(sheets.get_user, user_id)
+    if user is None or user.get("status") not in ("completed", "awaiting_correction"):
+        await asyncio.to_thread(
+            send_reply_sync,
+            reply_token,
+            "初期設定がまだ完了していません。「リセット」と送って設定を始めてください。",
+        )
+        return
+    await asyncio.to_thread(show_loading_sync, user_id, 15)
+    async def get_and_analyze():
+        image_bytes, mime_type = await asyncio.to_thread(fetch_line_image, event.message.id)
+        # 【修正】user_idを渡す
+        return await asyncio.to_thread(analyze_image, image_bytes, mime_type, user_id)
+    task = asyncio.create_task(get_and_analyze())
+    try:
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=15)
+        message = await asyncio.to_thread(save_analysis_and_build_message, user_id, user, result)
+        await asyncio.to_thread(send_reply_with_quick_replies_sync, reply_token, message)
+    except asyncio.TimeoutError:
+        await asyncio.to_thread(
+            send_reply_sync,
+            reply_token,
+            "⏳ ただいま写真を解析しています。終わり次第、こちらへお知らせします。",
+        )
+        try:
+            result = await task
+            message = await asyncio.to_thread(save_analysis_and_build_message, user_id, user, result)
+            await asyncio.to_thread(send_push_sync, user_id, message)
+            await asyncio.to_thread(sheets.save_push_log, user_id, "画像解析の結果通知")
+        except Exception as exc:
+            try:
+                await asyncio.to_thread(sheets.save_error_log, user_id, "process_image_event", str(exc))
+            except Exception:
+                pass
+            await asyncio.to_thread(
+                send_push_sync,
+                user_id,
+                "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
+            )
+    except Exception as exc:
+        try:
+            await asyncio.to_thread(sheets.save_error_log, user_id, "process_image_event", str(exc))
+        except Exception:
+            pass
+        # 【修正】reply_tokenが有効か確認し、無効ならPushで送信
+        try:
+            await asyncio.to_thread(send_reply_sync, reply_token, "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。")
+        except Exception:
+            await asyncio.to_thread(
+                send_push_sync,
+                user_id,
+                "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
+            )
     user_id = event.source.user_id
     reply_token = event.reply_token
     user = await asyncio.to_thread(sheets.get_user, user_id)
