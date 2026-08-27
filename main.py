@@ -576,6 +576,23 @@ def parse_text_intent_result(response_json: dict, *, allow_correction: bool) -> 
             "reply": "申し訳ありません。処理中に問題が発生しました。もう一度送っていただけますか？"
         }
 
+def _log_fallback_notice_if_any(user_id, result):
+    """Gemini→Groqフォールバック（または本命モデル以外での成功）が発生していた場合、
+    ユーザーへの返信には含めず、運用把握用にpush_logsシートへ記録するだけにする。
+
+    【重要】この関数は元々どこにも定義されておらず、呼び出し箇所（テキスト解析・画像解析の
+    どちらの結果処理でも）だけが残っていたためNameErrorで落ちていた。ここで実装を追加する。
+    Groqが実際にどれくらいの頻度で使われているかは、このログを見れば追える。
+    """
+    notice = result.pop("_gemini_fallback_notice", None)
+    if not notice:
+        return
+    try:
+        sheets.save_push_log(user_id, notice)
+    except Exception:
+        # 通知ログの保存に失敗しても、本来の返信処理は止めない。
+        pass
+
 def _deliver_text_analysis_result(reply_token, user_id, user, result, *, is_push):
     """Geminiのテキスト解析結果（食事 or 雑談）を保存し、Reply/Pushいずれかで届ける。"""
     try:
