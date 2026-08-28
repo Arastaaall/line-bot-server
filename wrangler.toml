@@ -1,18 +1,16 @@
 name = "diet-bot-worker"
 main = "index.ts"
 compatibility_date = "2024-01-01"
+preview_urls = false
 
-# KV Namespaceのバインディング
 [[kv_namespaces]]
 binding = "DAILY_LIMIT_KV"
 id = "449d99f632604fadadf3e638e4cab98f"
 
-# Durable Objectsのバインディング
 [[durable_objects.bindings]]
 name = "DAILY_LIMIT_DO"
 class_name = "DailyLimitCounter"
 
-# マイグレーション設定
 [[migrations]]
 tag = "v1"
-new_classes = ["DailyLimitCounter"]
+new_sqlite_classes = ["DailyLimitCounter"]
