@@ -1,0 +1,19 @@
+name: Deploy Cloudflare Worker
+
+on:
+  push:
+    branches:
+      - main  # もしデフォルトブランチが master なら 'master' に変更してください
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

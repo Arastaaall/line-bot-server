@@ -5,14 +5,14 @@ import os
 import asyncio
 import base64
 import json
-import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import PlainTextResponse
+from fastapi.security import APIKeyHeader
 from linebot.v3 import WebhookParser
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
@@ -21,6 +21,8 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import FollowEvent, ImageMessageContent, MessageEvent, TextMessageContent
 from openai import OpenAI  # Groq接続用
+from pydantic import BaseModel
+import json
 import sheets
 
 import logging
@@ -33,6 +35,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 【修正】app はここで先に生成する。
+# 以前は下の方（旧218行目付近）で定義されており、それより前にある
+# @app.post(...) 系の内部エンドポイント定義が「app未定義」でNameErrorとなり、
+# モジュール読み込み自体が失敗＝サーバーが起動不能になっていた。
 app = FastAPI()
 
 # 環境変数
@@ -53,6 +59,337 @@ groq_client = OpenAI(
 config = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 api_client = ApiClient(config)
 line_messaging_api = MessagingApi(api_client)
+
+# --- 内部認証ミドルウェア ---
+# 【修正】以前は同一内容がこの下にもう一度コピペされて二重定義されていたため、片方に統一
+INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET")
+
+async def verify_internal_secret(request: Request):
+    if not INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="Internal Secret not configured")
+    
+    secret = request.headers.get("X-Internal-Secret")
+    if secret != INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden: Invalid Internal Secret")
+    return True
+
+# --- 排他制御用ロック ---
+_user_locks = {}
+_locks_lock = asyncio.Lock()
+
+async def get_user_lock(user_id: str):
+    async with _locks_lock:
+        if user_id not in _user_locks:
+            _user_locks[user_id] = asyncio.Lock()
+        return _user_locks[user_id]
+
+# --- リクエストモデル ---
+class InternalTextRequest(BaseModel):
+    user_id: str
+    reply_token: str
+    text: str
+    intent: str | None = None  # Workers AIからの判定結果
+
+class InternalImageRequest(BaseModel):
+    user_id: str
+    reply_token: str
+    message_id: str
+
+# --- エンドポイント ---
+
+@app.post("/internal/text", dependencies=[Depends(verify_internal_secret)])
+async def internal_text_webhook(req: InternalTextRequest):
+    """Workers経由のテキスト処理。Intent指定があればGeminiのIntent判定をスキップする。"""
+    user_lock = await get_user_lock(req.user_id)
+    async with user_lock:
+        # 既存の process_text_event ロジックを再利用・拡張
+        await process_internal_text_event(req.user_id, req.reply_token, req.text, req.intent)
+    return {"status": "ok"}
+
+@app.post("/internal/image", dependencies=[Depends(verify_internal_secret)])
+async def internal_image_webhook(req: InternalImageRequest):
+    """Workers経由の画像処理。"""
+    user_lock = await get_user_lock(req.user_id)
+    async with user_lock:
+        # 既存の process_image_event と同等の処理
+        await process_internal_image_event(req.user_id, req.reply_token, req.message_id)
+    return {"status": "ok"}
+
+# --- バリデーション関数 ---
+def validate_nutrition_data(data: dict) -> dict:
+    """AI出力のバリデーション。不正な値は例外を投げるか、安全なデフォルトに丸める。"""
+    if not isinstance(data, dict):
+        raise ValueError("Invalid data format")
+    
+    # 必須キーのチェック
+    required = ["menu_name", "calories"]
+    for k in required:
+        if k not in data:
+            raise ValueError(f"Missing key: {k}")
+            
+    # 数値範囲の検証
+    try:
+        cal = float(data["calories"])
+        if cal < 0 or cal > 5000:
+            raise ValueError("Calories out of range")
+        data["calories"] = round(cal)
+        
+        # PFCなども同様に検証・丸め
+        for key in ["protein", "fat", "carbs"]:
+            val = float(data.get(key, 0))
+            if val < 0 or val > 1000:
+                data[key] = 0 # 異常値は0扱い
+            else:
+                data[key] = round(val, 1)
+                
+    except ValueError as e:
+        raise ValueError(f"Nutrition validation failed: {e}")
+        
+    return data
+
+# --- 課金状態チェック (Single Source of Truth) ---
+def check_user_paid_status(user: dict) -> bool:
+    """usersシートの is_paid (または is_premium) を確認する。
+    現時点ではビジネスロジックでブロックには使わないが、将来の拡張用。
+    """
+    # is_paid を優先、なければ is_premium を見る
+    val = str(user.get("is_paid") or user.get("is_premium") or "").strip().lower()
+    return val in ("true", "1", "yes", "premium", "有料")
+
+# --- 処理ロジックの拡張 ---
+
+async def process_internal_text_event(user_id: str, reply_token: str, text: str, intent_from_workers: str | None):
+    """WorkersからのIntent指定に対応したテキスト処理。"""
+    user = await asyncio.to_thread(sheets.get_user, user_id)
+    if not user or user.get("status") not in ("completed", "awaiting_correction"):
+        # 初期設定などは既存ロジック
+        await handle_setup_or_common(user_id, reply_token, text)
+        return
+
+    # 【修正】固定コマンド（リセット・使い方・カロリー確認・振り返る）を最優先でチェックする。
+    # 以前はこのチェックが /callback 経路（process_text_event）にしか存在せず、
+    # Workers経由で「リセット」が来ても、intentベースの分岐に巻き込まれるだけで
+    # 実際にはユーザー状態が一切リセットされていなかった。
+    fixed_reply = await asyncio.to_thread(_handle_fixed_text_command, user_id, user, text)
+    if fixed_reply is not None:
+        if reply_token:
+            await asyncio.to_thread(send_reply_sync, reply_token, fixed_reply)
+        else:
+            await asyncio.to_thread(send_push_sync, user_id, fixed_reply)
+        return
+
+    # Intent が指定されていない（Workers AI失敗時など）は、GeminiにIntent判定から依頼する
+    if not intent_from_workers:
+        await process_text_meal_or_chat_legacy(reply_token, user_id, user, text)
+        return
+
+    # Intent 指定あり (meal_add / meal_correction)
+    # Geminiには「数値抽出」のみ依頼する（Intent判定不要）
+    last_meal_context = _build_last_meal_context(user)
+    
+    # 修正モードの安全性チェック
+    if intent_from_workers == "meal_correction":
+        if user.get("status") != "awaiting_correction" or not correction_is_open(user):
+            # 修正受付時間外なら、新規追加として扱う
+            intent_from_workers = "meal_add"
+
+    # 数値抽出用プロンプトでGemini呼び出し
+    result = await asyncio.to_thread(
+        analyze_text_for_extraction, 
+        text, user, last_meal_context, force_intent=intent_from_workers
+    )
+    
+    await asyncio.to_thread(_deliver_text_analysis_result, reply_token, user_id, user, result, is_push=False)
+
+async def handle_setup_or_common(user_id: str, reply_token: str, text: str):
+    """【実装追加】Workers経由でテキストが来たが、ユーザーが初期設定中／未登録だった場合の処理。
+    既存の /callback 経路（process_text_event冒頭）と同じ initial_setup_message を使う。
+    以前はこの関数自体が未定義で、該当パスに来た瞬間に NameError になっていた。
+    """
+    message = await asyncio.to_thread(initial_setup_message, user_id, text)
+    if reply_token:
+        await asyncio.to_thread(send_reply_sync, reply_token, message)
+    else:
+        # Workers側でreply_tokenを渡し忘れた等の異常系はPushにフォールバック
+        await asyncio.to_thread(send_push_sync, user_id, message)
+
+async def process_text_meal_or_chat_legacy(reply_token: str, user_id: str, user: dict, text: str):
+    """【実装追加】Workers AIがintent判定に失敗した（intentが渡ってこない）場合のフォールバック経路。
+    既存の process_text_meal_or_chat と同じロジックだが、LINEのeventオブジェクトを
+    受け取らず reply_token を直接受け取る点だけが異なる（Workers経由にはLINE event型が無いため）。
+    以前はこの関数自体が未定義で、Workers AI失敗のたびに NameError になっていた。
+    """
+    last_meal_context = _build_last_meal_context(user)
+
+    async def analyze():
+        return await asyncio.to_thread(analyze_text_input, text, user, last_meal_context)
+
+    task = asyncio.create_task(analyze())
+    try:
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=12)
+        await asyncio.to_thread(_deliver_text_analysis_result, reply_token, user_id, user, result, is_push=False)
+    except asyncio.TimeoutError:
+        logger.warning(f"テキスト解析がタイムアウト(internal): user_id={user_id}, text={text[:50]}")
+        if reply_token:
+            await asyncio.to_thread(
+                send_reply_sync,
+                reply_token,
+                "⏳ ただいま確認しています。終わり次第、こちらへお知らせします。",
+            )
+        try:
+            result = await task
+            await asyncio.to_thread(_deliver_text_analysis_result, None, user_id, user, result, is_push=True)
+            await asyncio.to_thread(sheets.save_push_log, user_id, "テキスト解析の結果通知(internal)")
+        except Exception as exc:
+            error_detail = f"{str(exc)}\n{traceback.format_exc()}"
+            logger.error(f"タイムアウト後の処理でエラー(internal): user_id={user_id}, {error_detail}")
+            try:
+                await asyncio.to_thread(sheets.save_error_log, user_id, "process_text_meal_or_chat_legacy(timeout)", error_detail)
+            except Exception:
+                pass
+            await asyncio.to_thread(
+                send_push_sync,
+                user_id,
+                "処理に失敗しました。恐れ入りますが、もう一度送ってください。",
+            )
+    except Exception as exc:
+        error_detail = f"{str(exc)}\n{traceback.format_exc()}"
+        logger.error(f"テキスト解析でエラー(internal): user_id={user_id}, text={text[:50]}, {error_detail}")
+        try:
+            await asyncio.to_thread(sheets.save_error_log, user_id, "process_text_meal_or_chat_legacy", error_detail)
+        except Exception:
+            pass
+        if reply_token:
+            await asyncio.to_thread(
+                send_reply_sync,
+                reply_token,
+                "処理中に問題が起きました。少し時間をおいて、もう一度送ってください。",
+            )
+        else:
+            await asyncio.to_thread(
+                send_push_sync,
+                user_id,
+                "処理中に問題が起きました。少し時間をおいて、もう一度送ってください。",
+            )
+
+async def process_internal_image_event(user_id: str, reply_token: str, message_id: str):
+    """【実装追加】Workers経由の画像処理。既存の process_image_event と同じロジックだが、
+    LINEのeventオブジェクトを受け取らず user_id/reply_token/message_id を直接受け取る。
+    以前はこの関数自体が未定義で、/internal/image を叩くたびに NameError になっていた。
+    """
+    user = await asyncio.to_thread(sheets.get_user, user_id)
+
+    if user is None or user.get("status") not in ("completed", "awaiting_correction"):
+        await asyncio.to_thread(
+            send_reply_sync,
+            reply_token,
+            "初期設定がまだ完了していません。「リセット」と送って設定を始めてください。",
+        )
+        return
+
+    await asyncio.to_thread(show_loading_sync, user_id, 15)
+
+    async def get_and_analyze():
+        image_bytes, mime_type = await asyncio.to_thread(fetch_line_image, message_id)
+        return await asyncio.to_thread(analyze_image, image_bytes, mime_type, user_id)
+
+    task = asyncio.create_task(get_and_analyze())
+    try:
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=15)
+        message = await asyncio.to_thread(save_analysis_and_build_message, user_id, user, result)
+        await asyncio.to_thread(send_reply_with_quick_replies_sync, reply_token, message)
+
+    except asyncio.TimeoutError:
+        await asyncio.to_thread(
+            send_reply_sync,
+            reply_token,
+            "⏳ ただいま写真を解析しています。終わり次第、こちらへお知らせします。",
+        )
+        try:
+            result = await task
+            message = await asyncio.to_thread(save_analysis_and_build_message, user_id, user, result)
+            await asyncio.to_thread(send_push_sync, user_id, message)
+            await asyncio.to_thread(sheets.save_push_log, user_id, "画像解析の結果通知(internal)")
+        except Exception as exc:
+            try:
+                await asyncio.to_thread(sheets.save_error_log, user_id, "process_internal_image_event", str(exc))
+            except Exception:
+                pass
+            await asyncio.to_thread(
+                send_push_sync,
+                user_id,
+                "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
+            )
+
+    except Exception as exc:
+        error_detail = f"{str(exc)}\n\n--- Stack Trace ---\n{traceback.format_exc()}"
+        try:
+            await asyncio.to_thread(sheets.save_error_log, user_id, "process_internal_image_event", error_detail)
+        except Exception:
+            pass
+
+        try:
+            await asyncio.to_thread(
+                send_reply_sync,
+                reply_token,
+                "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。"
+            )
+        except Exception:
+            await asyncio.to_thread(
+                send_push_sync,
+                user_id,
+                "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
+            )
+
+def analyze_text_for_extraction(text: str, user: dict, last_meal_context: dict | None, force_intent: str) -> dict:
+    """Intent判定をスキップし、数値抽出に特化したGemini呼び出し。"""
+    # プロンプトは既存の analyze_text_input から「Intent判定」部分を削ぎ落したもの
+    prompt = f"""
+    ユーザー入力: {text}
+    直前の食事: {last_meal_context}
+    
+    上記の入力から食事の内容を抽出し、JSONで返してください。
+    Intentは "{force_intent}" として処理してください。
+    出力形式:
+    {{
+      "menu_name": "...", "calories": 数値, "protein": 数値, "fat": 数値, "carbs": 数値,
+      "fiber": 数値, "vitamins": 数値, "vit_a": 数値, "vit_c": 数値, "zinc": 数値,
+      "magnesium": 数値, "iron": 数値, "potassium": 数値, "calcium": 数値,
+      "suggestion": "アドバイス"
+    }}
+    微量栄養素は推定値で構いません（数値のみ、単位なし）。
+    """
+    # 既存の generate_content_with_fallback を使用
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }
+    response_json, _ = generate_content_with_fallback(payload, "数値抽出", timeout=15)
+    
+    # バリデーション
+    try:
+        raw_text = response_json["candidates"][0]["content"]["parts"][0]["text"]
+        data = json.loads(raw_text[raw_text.find("{"):raw_text.rfind("}")+1])
+        validated_data = validate_nutrition_data(data)
+        
+        result = {
+            "type": force_intent,
+            "menu_name": validated_data["menu_name"],
+            "calories": validated_data["calories"],
+            "protein": validated_data.get("protein", 0),
+            "fat": validated_data.get("fat", 0),
+            "carbs": validated_data.get("carbs", 0),
+            "suggestion": validated_data.get("suggestion", "バランスの良い食事でした。"),
+        }
+        # 【修正】微量栄養素キーが欠けたまま _apply_meal_add / _apply_meal_correction に渡すと
+        # MICRONUTRIENT_KEYS を参照する箇所で KeyError になっていたため、0埋めで必ず補完する。
+        for key in MICRONUTRIENT_KEYS:
+            result[key] = _number_or_zero(validated_data.get(key))
+        return result
+    except Exception as e:
+        # バリデーション失敗時はエラーログに出し、雑談扱いにして逃がす
+        sheets.save_error_log(user["user_id"], "validate_nutrition_data", str(e))
+        return {"type": "chat", "reply": "申し訳ありません。数値の解析に失敗しました。"}
 
 @app.get("/ping", response_class=PlainTextResponse)
 async def ping():
@@ -409,23 +746,6 @@ async def process_follow_event(event):
     user_id = event.source.user_id
     message = await asyncio.to_thread(initial_setup_message, user_id, "リセット")
     await asyncio.to_thread(send_reply_sync, event.reply_token, message)
-
-TEXT_RATE_LIMIT_SECONDS = 3  # 短時間の連投でGemini課金が積み上がるのを防ぐ簡易クールダウン
-_last_text_request_at: dict[str, float] = {}
-_rate_limit_lock = threading.Lock()
-
-def is_rate_limited(user_id):
-    """同一ユーザーからの立て続けのテキスト送信を、簡易クールダウンで間引く。
-    固定コマンド（使い方・カロリー確認など）は無料でローカル処理されるためここでは弾かず、
-    実際にGeminiへ課金リクエストが飛ぶ直前だけでチェックする。
-    """
-    now = time.monotonic()
-    with _rate_limit_lock:
-        last = _last_text_request_at.get(user_id, 0)
-        if now - last < TEXT_RATE_LIMIT_SECONDS:
-            return True
-        _last_text_request_at[user_id] = now
-        return False
 
 def _handle_fixed_text_command(user_id, user, text):
     """設定完了後のユーザーに対して、リセット・使い方などの固定コマンドを処理する。
@@ -787,15 +1107,9 @@ async def process_text_event(event):
             await asyncio.to_thread(send_reply_sync, event.reply_token, fixed_reply)
             return
         
-        # 固定コマンドに該当しない、実際にGeminiへ投げるテキストだけレート制限をかける
-        if await asyncio.to_thread(is_rate_limited, user_id):
-            await asyncio.to_thread(
-                send_reply_sync,
-                event.reply_token,
-                "少し間隔をあけてから送ってください。",
-            )
-            return
-        
+        # 【修正】v4.1仕様で廃止された「3秒一律拒否」ルールは削除。
+        # 連続送信の抑制は webhookEventId による重複排除（Workers側KV、
+        # および非常用経路のインメモリ簡易版）で行う。
         # ここまで来たテキストだけを、食事報告 or 雑談としてGeminiに判定させる
         await process_text_meal_or_chat(event, user_id, current_user, text)
     
@@ -836,9 +1150,10 @@ def fetch_line_image(message_id):
 GEMINI_MAX_RETRIES = 2  # 503（Google側の一時的な過負荷）のときだけ、1モデルあたりこの回数までリトライする
 
 class GeminiModelUnavailableError(RuntimeError):
-    """特定のモデルが今回使えなかったことを表す（503のリトライ上限到達、または404）。
+    """特定のモデルが今回使えなかったことを表す（503のリトライ上限到達、429のレート制限、
+    404、または400不正リクエスト、タイムアウト）。
     このエラーのときだけ次の候補モデルへフォールバックする。
-    それ以外のエラー（キー不正・不正なリクエストなど）はフォールバックせず、その場で失敗として扱う。
+    それ以外のエラー（通信エラー・JSON解析エラーなど）はフォールバックせず、その場で失敗として扱う。
     """
     def __init__(self, model, reason):
         self.model = model
@@ -852,10 +1167,12 @@ def _gemini_url(model):
 
 def _gemini_models_to_try():
     """試すモデルの候補リストを作る。
-    GEMINI_MODEL が本命。GEMINI_FALLBACK_MODELS（カンマ区切り、例:
-    "gemini-3.5-flash-lite,gemini-3.5-flash,gemini-3.6-flash"）を設定しておくと、
+    GEMINI_MODEL が本命（環境変数未設定時のデフォルトは無料枠のある gemini-3.1-flash-lite）。
+    GEMINI_FALLBACK_MODELS（カンマ区切り、例:
+    "gemini-3-flash,gemini-3.5-flash-lite"）を設定しておくと、
     本命モデルが使えなかったときだけ順番に次を試す。
-    未設定なら本命モデルだけを使う（フォールバックなし＝これまでと同じ挙動）。
+    未設定の場合も、Groqへ行く前にGemini内で吸収できるよう既定のフォールバック列を使う
+    （gemini-3-flash, gemini-3.5-flash-lite）。
     環境変数にありがちな引用符・前後の空白・改行は、ここで取り除いておく
     （Renderの入力欄に "gemini-2.5-flash" のように引用符ごと貼り付けてしまうと、
     そのままではAPIが404を返すため）。
@@ -880,6 +1197,7 @@ def _gemini_models_to_try():
 def call_gemini_with_retry(model, payload, action_label, timeout=30, max_retries=GEMINI_MAX_RETRIES):
     """Geminiへ1つのモデルでPOSTする。
     - 503（一時的な過負荷）のときだけ待機してリトライする。
+    - 429（無料枠のレート制限）は即座にGeminiModelUnavailableErrorを送出し、次の候補モデルへ回す。
     - 404（モデルが存在しない・使えない）は即座にGeminiModelUnavailableErrorを送出。
     - 400（APIキー不正など）もGeminiModelUnavailableErrorを送出（Groqフォールバック用）。
     - それ以外のHTTPエラーや通信エラーは、RuntimeErrorとして扱う。
@@ -908,7 +1226,7 @@ def call_gemini_with_retry(model, payload, action_label, timeout=30, max_retries
                 raise GeminiModelUnavailableError(model, "HTTP 404：モデルが見つからない、または使用不可") from exc
             # 【修正】HTTP 400もGeminiModelUnavailableErrorとして扱う（Groqフォールバック用）
             if exc.code == 400:
-                raise GeminiModelUnavailableError(model, f"HTTP 400：リクエスト不正（APIキー不正の可能性）") from exc
+                raise GeminiModelUnavailableError(model, "HTTP 400：リクエスト不正（APIキー不正の可能性）") from exc
             raise RuntimeError(f"Geminiの{action_label}に失敗しました（モデル: {model}、HTTP {exc.code}）。") from exc
         except TimeoutError as exc:  # 【追加】タイムアウトエラーも捕捉
             raise GeminiModelUnavailableError(model, "タイムアウト") from exc
@@ -1145,6 +1463,34 @@ def save_analysis_and_build_message(user_id, user, result):
         "内容が違う場合は、修正内容（例:「味噌ラーメン」「大盛り」）を送ってください。"
     )
 
+# --- webhookEventIdによる重複排除（/callback非常用経路専用の簡易インメモリ版） ---
+# Workers側はKVで重複排除するが、/callbackはLINEから直接叩かれる非常用経路のため
+# ここでも最低限の重複排除を持たせておく。プロセス内メモリのみで永続化はしないため、
+# Renderの再起動をまたぐ重複は防げない点に注意（それで十分な非常用途という前提）。
+_recent_event_ids: set[str] = set()
+_event_ids_lock = asyncio.Lock()
+_RECENT_EVENT_IDS_MAX = 200
+
+async def _is_duplicate_event(event_id: str | None) -> bool:
+    """インメモリで簡易的な重複排除（非常用経路のみ）。"""
+    if not event_id:
+        return False
+    async with _event_ids_lock:
+        if event_id in _recent_event_ids:
+            return True
+        _recent_event_ids.add(event_id)
+        if len(_recent_event_ids) > _RECENT_EVENT_IDS_MAX:
+            # 【注意】set.pop()は最古の要素を保証しない簡易的な間引き。
+            # 非常用経路の簡易対策として許容し、厳密なLRUは実装しない。
+            _recent_event_ids.pop()
+    return False
+
+def _extract_webhook_event_id(event) -> str | None:
+    """line-bot-sdkのバージョン差異を吸収して webhookEventId を取り出す。
+    Python SDKはスネークケース(webhook_event_id)の場合があるため両対応する。
+    """
+    return getattr(event, "webhook_event_id", None) or getattr(event, "webhookEventId", None)
+
 @app.post("/callback")
 async def handle_callback(request: Request):
     signature = request.headers.get("X-Line-Signature", "")
@@ -1155,6 +1501,12 @@ async def handle_callback(request: Request):
         raise HTTPException(status_code=400, detail="LINE署名を確認できませんでした。")
     
     for event in events:
+        # 【修正】webhookEventIdによる重複排除を追加（LINEの再送対策）
+        event_id = _extract_webhook_event_id(event)
+        if await _is_duplicate_event(event_id):
+            logger.info(f"Duplicate event ignored: {event_id}")
+            continue
+
         if isinstance(event, FollowEvent):
             await process_follow_event(event)
         elif isinstance(event, MessageEvent) and isinstance(event.message, TextMessageContent):

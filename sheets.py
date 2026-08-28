@@ -30,6 +30,7 @@ USER_COLUMNS = {
     "target_calories": "target_calories",
     "updated_at": "updated_at",
     "is_premium": "is_premium",
+    "is_paid": "is_paid",  # 追加
     "goal_mode": "goal_mode",
     "pal": "pal(def:1.375)",
     "meal_style": "meal_style",
@@ -39,7 +40,8 @@ USER_COLUMNS = {
 }
 
 # 将来の列追加に備え、usersシートにまだ列が無くてもエラーにしない項目
-OPTIONAL_USER_KEYS = {"last_log_id"}
+# OPTIONAL_USER_KEYS にもis_paidを追加（列がまだ無くてもエラーにしない）
+OPTIONAL_USER_KEYS = {"last_log_id", "is_paid"}
 _OPTIONAL_USER_COLUMNS = {USER_COLUMNS[key] for key in OPTIONAL_USER_KEYS}
 
 _FORMULA_TRIGGER_PREFIXES = ("=", "+", "-", "@", "\t", "\r")

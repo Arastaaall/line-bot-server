@@ -1,0 +1,13 @@
+name = "diet-bot-worker"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# Daily Limitを正確に数えるための特別な機能（Durable Object）の設定
+[[durable_objects.bindings]]
+name = "DAILY_LIMIT_DO"
+class_name = "DailyLimitCounter"
+
+# 上記の機能を有効化するための宣言
+[[migrations]]
+tag = "v1"
+new_classes = ["DailyLimitCounter"]
