@@ -94,6 +94,25 @@ async function handleWebhook(request: Request, env: Env, ctx: ExecutionContext):
 }
 
 async function processEvent(event: any, env: Env) {
+  const replyToken = event.replyToken;
+
+  // 【追加】ctx.waitUntil(processEvent(...))の中で例外が起きると、
+  // メインのfetchハンドラは既に200 OKを返した後なので、Cloudflareの
+  // Errorsカウントにも上がらず、ユーザーには何も届かないまま静かに失敗する
+  // （今回のexpirationTtlのバグがまさにこれだった）。
+  // 同種の問題を今後すぐ気づけるよう、ここで丸ごと捕捉してログに残し、
+  // 可能な場合はユーザーにも最低限の通知を返す。
+  try {
+    await processEventInner(event, env);
+  } catch (e) {
+    console.error("processEvent failed:", e);
+    if (replyToken) {
+      await replyToLine(replyToken, "処理中に問題が起きました。少し時間をおいて、もう一度お試しください。", env).catch(() => {});
+    }
+  }
+}
+
+async function processEventInner(event: any, env: Env) {
   const eventId = event.webhookEventId;
   
   // 3. 重複配信排除 (KV使用)
@@ -142,9 +161,6 @@ async function handleTextMessage(event: any, env: Env) {
   const text = event.message.text.trim();
   const userId = event.source.userId;
   const replyToken = event.replyToken;
-
-  // 【デバッグ用】ここから処理が始まっていることをログに出す
-  console.log(`[DEBUG] handleTextMessage started: userId=${userId}, text="${text}"`);
 
   // 4. 固定コマンドのローカル処理
   // 【修正】「リセット」はユーザーの状態(status)をRenderのSheets側で書き換える必要があるため、
@@ -237,12 +253,23 @@ async function verifyLineSignature(body: string, signature: string, secret: stri
 async function isDuplicateEvent(eventId: string, env: Env): Promise<boolean> {
   if (!eventId) return false;
   const key = `dup:${eventId}`;
-  const existing = await env.DAILY_LIMIT_KV.get(key);
-  if (existing) return true;
-  
-  // 10秒間だけ保持して重複を防ぐ
-  await env.DAILY_LIMIT_KV.put(key, "1", { expirationTtl: 10 });
-  return false;
+  try {
+    const existing = await env.DAILY_LIMIT_KV.get(key);
+    if (existing) return true;
+
+    // 【修正】Cloudflare KVのexpirationTtlは現在60秒以上でないと400エラーになる
+    // （以前は10秒を指定しており、KV PUTのたびに例外を投げていた）。
+    // 重複排除としては60秒あれば十分（LINEの再送は通常もっと早いタイミングで来る）。
+    await env.DAILY_LIMIT_KV.put(key, "1", { expirationTtl: 60 });
+    return false;
+  } catch (e) {
+    // 【追加】KV側で何か起きても、ここで処理全体を止めない（fail-open）。
+    // 今回のTTLエラーのように、ここで例外を投げるとprocessEvent全体が
+    // ctx.waitUntil内で静かに死に、ユーザーには何も届かなくなってしまう。
+    // 重複排除に失敗しても「重複ではない」として処理を続行する方が実害が小さい。
+    console.error("isDuplicateEvent failed, treating as non-duplicate:", e);
+    return false;
+  }
 }
 
 async function classifyWithWorkersAI(text: string, env: Env): Promise<any> {
@@ -311,11 +338,6 @@ async function proxyToRender(env: Env, data: { endpoint: string, payload: any })
   // ステータスコードのチェック・タイムアウト・失敗時のログを追加し、
   // 呼び出し側が失敗を検知してユーザーへフォールバック通知できるようにする。
   const url = `${env.RENDER_URL}${data.endpoint}`;
-
-    // 【デバッグ用】Renderへの通信を試みることをログに出す
-  console.log(`[DEBUG] proxyToRender: Sending request to ${url}`);
-
-
   try {
     // 【重要・main.py側の変更とセット】以前はRender側が「LINEへの返信/Push完了まで」
     // このHTTPリクエストへの応答を返さない実装だったため、Renderの処理時間が
