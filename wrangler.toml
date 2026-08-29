@@ -1,24 +1,25 @@
 name = "diet-bot-worker"
 main = "index.ts"
 compatibility_date = "2024-01-01"
-preview_urls = false
 
+# KV Namespace のバインディング
 [[kv_namespaces]]
 binding = "DAILY_LIMIT_KV"
 id = "449d99f632604fadadf3e638e4cab98f"
 
+# Durable Objects のバインディング
 [[durable_objects.bindings]]
 name = "DAILY_LIMIT_DO"
 class_name = "DailyLimitCounter"
 
+# マイグレーション設定
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["DailyLimitCounter"]
+new_classes = ["DailyLimitCounter"]
 
+# Observability 設定（修正版）
 [observability]
-enabled = false
-head_sampling_rate = 1
-redact_query_string = false
+enabled = true
 
 [observability.logs]
 enabled = true
@@ -28,5 +29,3 @@ invocation_logs = true
 
 [observability.traces]
 enabled = false
-persist = true
-head_sampling_rate = 1

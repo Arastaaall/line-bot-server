@@ -143,6 +143,9 @@ async function handleTextMessage(event: any, env: Env) {
   const userId = event.source.userId;
   const replyToken = event.replyToken;
 
+  // 【デバッグ用】ここから処理が始まっていることをログに出す
+  console.log(`[DEBUG] handleTextMessage started: userId=${userId}, text="${text}"`);
+
   // 4. 固定コマンドのローカル処理
   // 【修正】「リセット」はユーザーの状態(status)をRenderのSheets側で書き換える必要があるため、
   // Workers側で即答してはいけない。以前はここで「リセットしました」とローカル返信していたが、
@@ -308,6 +311,11 @@ async function proxyToRender(env: Env, data: { endpoint: string, payload: any })
   // ステータスコードのチェック・タイムアウト・失敗時のログを追加し、
   // 呼び出し側が失敗を検知してユーザーへフォールバック通知できるようにする。
   const url = `${env.RENDER_URL}${data.endpoint}`;
+
+    // 【デバッグ用】Renderへの通信を試みることをログに出す
+  console.log(`[DEBUG] proxyToRender: Sending request to ${url}`);
+
+
   try {
     // 【重要・main.py側の変更とセット】以前はRender側が「LINEへの返信/Push完了まで」
     // このHTTPリクエストへの応答を返さない実装だったため、Renderの処理時間が
