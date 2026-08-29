@@ -243,7 +243,10 @@ async function isDuplicateEvent(eventId: string, env: Env): Promise<boolean> {
 }
 
 async function classifyWithWorkersAI(text: string, env: Env): Promise<any> {
-  const model = env.WORKERS_AI_MODEL || "@cf/meta/llama-3.1-8b-instruct";
+  // 【軽量化】判定用途は速度優先でよいため、既定モデルを低遅延版(-fast)に変更。
+  // 通常の8bモデルより応答が速く、失敗率が下がることで legacy(Render側でGeminiに
+  // intentから判定させ直す)経路に落ちる頻度そのものを減らせる。
+  const model = env.WORKERS_AI_MODEL || "@cf/meta/llama-3.1-8b-instruct-fast";
   const url = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai/run/${model}`;
   
   const prompt = `
@@ -257,13 +260,17 @@ Output ONLY valid JSON: {"intent": "...", "reply": "..."}
 Input: "${text.replace(/"/g, '\\"')}"
 `;
 
+  // 【修正】以前はタイムアウト指定が無く、Workers AIが遅延した場合に
+  // どれだけ待つか不定だった。ここで明示的に4秒で切り上げ、失敗時は
+  // 即座にRender側のフォールバック判定（intent: null）に委ねる。
   const response = await fetch(url, {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${env.CF_API_TOKEN}`,
       "Content-Type": "application/json"
     },
-    body: JSON.stringify({ prompt })
+    body: JSON.stringify({ prompt }),
+    signal: AbortSignal.timeout(4000),
   });
 
   if (!response.ok) throw new Error("AI API Error");
@@ -302,6 +309,14 @@ async function proxyToRender(env: Env, data: { endpoint: string, payload: any })
   // 呼び出し側が失敗を検知してユーザーへフォールバック通知できるようにする。
   const url = `${env.RENDER_URL}${data.endpoint}`;
   try {
+    // 【重要・main.py側の変更とセット】以前はRender側が「LINEへの返信/Push完了まで」
+    // このHTTPリクエストへの応答を返さない実装だったため、Renderの処理時間が
+    // 伸びる（Geminiのフォールバック連鎖など）とここのタイムアウト値と直接衝突し、
+    // Workers側が「失敗」と誤判定してエラーメッセージを二重送信しかねなかった。
+    // main.py側を「受け取ったら即座に200を返し、処理はバックグラウンドで続行する」
+    // 方式に変更したことで、Renderの応答はほぼ即時になる。そのためここのタイムアウトは
+    // 「Renderへ処理を渡せたかどうか」だけを見る短い値（8秒）に短縮する。
+    // ※ main.py側の /internal/text, /internal/image を非同期化する変更と必ずセットでデプロイすること。
     const response = await fetch(url, {
       method: "POST",
       headers: {
@@ -309,7 +324,7 @@ async function proxyToRender(env: Env, data: { endpoint: string, payload: any })
         "X-Internal-Secret": env.INTERNAL_SECRET
       },
       body: JSON.stringify(data.payload),
-      signal: AbortSignal.timeout(20000), // 20秒でタイムアウト（Render側が固まった場合の保険）
+      signal: AbortSignal.timeout(8000),
     });
 
     if (!response.ok) {

@@ -97,23 +97,49 @@ class InternalImageRequest(BaseModel):
 
 # --- エンドポイント ---
 
+def _log_background_task_error(task: asyncio.Task):
+    """バックグラウンドタスク内で捕捉されずに漏れた例外だけを拾ってログに残す
+    （各処理関数の内部で基本的にはtry/exceptしているが、二重の安全網として）。
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        logger.error(f"バックグラウンドタスクが失敗しました: {exc}\n{traceback.format_exc()}")
+
 @app.post("/internal/text", dependencies=[Depends(verify_internal_secret)])
 async def internal_text_webhook(req: InternalTextRequest):
-    """Workers経由のテキスト処理。Intent指定があればGeminiのIntent判定をスキップする。"""
-    user_lock = await get_user_lock(req.user_id)
-    async with user_lock:
-        # 既存の process_text_event ロジックを再利用・拡張
-        await process_internal_text_event(req.user_id, req.reply_token, req.text, req.intent)
-    return {"status": "ok"}
+    """Workers経由のテキスト処理。Intent指定があればGeminiのIntent判定をスキップする。
+
+    【重要な設計変更】以前はここで処理の完了（Gemini呼び出し・Sheets保存・
+    LINE返信/Pushまで）を全てawaitしてからHTTPレスポンスを返していたため、
+    Workers側(index.ts の proxyToRender)のfetchタイムアウトと、Render側で
+    設定している処理タイムアウトの数値が食い違うと、Workersが「失敗」と
+    誤判定して二重にエラー通知を送りかねない状態だった。
+    実際にLINEへの返信/PushはRenderがこの関数の中で直接行うため、Workersは
+    「Renderが処理を受け取った」ことさえ分かればよく、処理の完了を待つ必要はない。
+    そのため asyncio.create_task で処理を切り離し、即座に200を返す。
+    """
+    async def _run():
+        user_lock = await get_user_lock(req.user_id)
+        async with user_lock:
+            await process_internal_text_event(req.user_id, req.reply_token, req.text, req.intent)
+
+    task = asyncio.create_task(_run())
+    task.add_done_callback(_log_background_task_error)
+    return {"status": "accepted"}
 
 @app.post("/internal/image", dependencies=[Depends(verify_internal_secret)])
 async def internal_image_webhook(req: InternalImageRequest):
-    """Workers経由の画像処理。"""
-    user_lock = await get_user_lock(req.user_id)
-    async with user_lock:
-        # 既存の process_image_event と同等の処理
-        await process_internal_image_event(req.user_id, req.reply_token, req.message_id)
-    return {"status": "ok"}
+    """Workers経由の画像処理。理由は internal_text_webhook のコメントを参照。"""
+    async def _run():
+        user_lock = await get_user_lock(req.user_id)
+        async with user_lock:
+            await process_internal_image_event(req.user_id, req.reply_token, req.message_id)
+
+    task = asyncio.create_task(_run())
+    task.add_done_callback(_log_background_task_error)
+    return {"status": "accepted"}
 
 # --- バリデーション関数 ---
 def validate_nutrition_data(data: dict) -> dict:
@@ -162,8 +188,9 @@ async def process_internal_text_event(user_id: str, reply_token: str, text: str,
     """WorkersからのIntent指定に対応したテキスト処理。"""
     user = await asyncio.to_thread(sheets.get_user, user_id)
     if not user or user.get("status") not in ("completed", "awaiting_correction"):
-        # 初期設定などは既存ロジック
-        await handle_setup_or_common(user_id, reply_token, text)
+        # 初期設定などは既存ロジック。
+        # 【軽量化】ここで取得済みのuserをそのまま渡し、Sheetsへの重複読み込みを避ける。
+        await handle_setup_or_common(user_id, reply_token, text, user)
         return
 
     # 【修正】固定コマンド（リセット・使い方・カロリー確認・振り返る）を最優先でチェックする。
@@ -194,19 +221,75 @@ async def process_internal_text_event(user_id: str, reply_token: str, text: str,
             intent_from_workers = "meal_add"
 
     # 数値抽出用プロンプトでGemini呼び出し
-    result = await asyncio.to_thread(
-        analyze_text_for_extraction, 
-        text, user, last_meal_context, force_intent=intent_from_workers
-    )
-    
-    await asyncio.to_thread(_deliver_text_analysis_result, reply_token, user_id, user, result, is_push=False)
+    # 【修正】以前はここに時間の上限が一切無く、Gemini呼び出しが長引くと
+    # 応答トークンが無言のまま期限切れになり、Pushへの切り替えすら発生しない
+    # （ユーザーに何も届かない）危険があった。他の経路と同じタイムアウト＋
+    # Pushフォールバックの仕組みをここにも揃える。
+    async def analyze():
+        return await asyncio.to_thread(
+            analyze_text_for_extraction,
+            text, user, last_meal_context, force_intent=intent_from_workers
+        )
 
-async def handle_setup_or_common(user_id: str, reply_token: str, text: str):
+    task = asyncio.create_task(analyze())
+    try:
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=TEXT_TOTAL_TIMEOUT)
+        await asyncio.to_thread(_deliver_text_analysis_result, reply_token, user_id, user, result, is_push=False)
+    except asyncio.TimeoutError:
+        logger.warning(f"数値抽出がタイムアウト(internal): user_id={user_id}, text={text[:50]}")
+        if reply_token:
+            await asyncio.to_thread(
+                send_reply_sync,
+                reply_token,
+                "⏳ ただいま確認しています。終わり次第、こちらへお知らせします。",
+            )
+        try:
+            result = await task
+            await asyncio.to_thread(_deliver_text_analysis_result, None, user_id, user, result, is_push=True)
+            await asyncio.to_thread(sheets.save_push_log, user_id, "数値抽出の結果通知(internal)")
+        except Exception as exc:
+            error_detail = f"{str(exc)}\n{traceback.format_exc()}"
+            logger.error(f"タイムアウト後の処理でエラー(internal数値抽出): user_id={user_id}, {error_detail}")
+            try:
+                await asyncio.to_thread(sheets.save_error_log, user_id, "process_internal_text_event(timeout)", error_detail)
+            except Exception:
+                pass
+            await asyncio.to_thread(
+                send_push_sync,
+                user_id,
+                "処理に失敗しました。恐れ入りますが、もう一度送ってください。",
+            )
+    except Exception as exc:
+        error_detail = f"{str(exc)}\n{traceback.format_exc()}"
+        logger.error(f"数値抽出でエラー(internal): user_id={user_id}, text={text[:50]}, {error_detail}")
+        try:
+            await asyncio.to_thread(sheets.save_error_log, user_id, "process_internal_text_event", error_detail)
+        except Exception:
+            pass
+        if reply_token:
+            await asyncio.to_thread(
+                send_reply_sync,
+                reply_token,
+                "処理中に問題が起きました。少し時間をおいて、もう一度送ってください。",
+            )
+        else:
+            await asyncio.to_thread(
+                send_push_sync,
+                user_id,
+                "処理中に問題が起きました。少し時間をおいて、もう一度送ってください。",
+            )
+
+async def handle_setup_or_common(user_id: str, reply_token: str, text: str, user=None):
     """【実装追加】Workers経由でテキストが来たが、ユーザーが初期設定中／未登録だった場合の処理。
     既存の /callback 経路（process_text_event冒頭）と同じ initial_setup_message を使う。
     以前はこの関数自体が未定義で、該当パスに来た瞬間に NameError になっていた。
+
+    【軽量化】呼び出し側が既にuserを取得済みならそれを渡すことで、
+    initial_setup_message内部での二重読み込み（Sheets全件読み込み）を避ける。
     """
-    message = await asyncio.to_thread(initial_setup_message, user_id, text)
+    message = await asyncio.to_thread(
+        initial_setup_message, user_id, text, user if user is not None else _NOT_PROVIDED
+    )
     if reply_token:
         await asyncio.to_thread(send_reply_sync, reply_token, message)
     else:
@@ -226,7 +309,7 @@ async def process_text_meal_or_chat_legacy(reply_token: str, user_id: str, user:
 
     task = asyncio.create_task(analyze())
     try:
-        result = await asyncio.wait_for(asyncio.shield(task), timeout=12)
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=TEXT_TOTAL_TIMEOUT)
         await asyncio.to_thread(_deliver_text_analysis_result, reply_token, user_id, user, result, is_push=False)
     except asyncio.TimeoutError:
         logger.warning(f"テキスト解析がタイムアウト(internal): user_id={user_id}, text={text[:50]}")
@@ -295,7 +378,7 @@ async def process_internal_image_event(user_id: str, reply_token: str, message_i
 
     task = asyncio.create_task(get_and_analyze())
     try:
-        result = await asyncio.wait_for(asyncio.shield(task), timeout=15)
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=IMAGE_TOTAL_TIMEOUT)
         message = await asyncio.to_thread(save_analysis_and_build_message, user_id, user, result)
         await asyncio.to_thread(send_reply_with_quick_replies_sync, reply_token, message)
 
@@ -364,7 +447,9 @@ def analyze_text_for_extraction(text: str, user: dict, last_meal_context: dict |
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"responseMimeType": "application/json"},
     }
-    response_json, _ = generate_content_with_fallback(payload, "数値抽出", timeout=15)
+    response_json, _ = generate_content_with_fallback(
+        payload, "数値抽出", timeout=TEXT_GEMINI_BUDGET, per_model_timeout=TEXT_PER_MODEL_TIMEOUT
+    )
     
     # バリデーション
     try:
@@ -391,9 +476,12 @@ def analyze_text_for_extraction(text: str, user: dict, last_meal_context: dict |
         sheets.save_error_log(user["user_id"], "validate_nutrition_data", str(e))
         return {"type": "chat", "reply": "申し訳ありません。数値の解析に失敗しました。"}
 
-@app.get("/ping", response_class=PlainTextResponse)
+@app.api_route("/ping", methods=["GET", "HEAD"], response_class=PlainTextResponse)
 async def ping():
-    """UptimeRobot用。外部APIを呼ばず、サーバーが起きていることだけを返す。"""
+    """UptimeRobot用。外部APIを呼ばず、サーバーが起きていることだけを返す。
+    【修正】UptimeRobotの監視方式によってはHEADで叩いてくることがあり、
+    GET専用のままだと405が返ってログを汚す（実害はないが紛らわしいため）HEADも許可する。
+    """
     return "OK"
 
 @app.get("/health")
@@ -836,7 +924,9 @@ def analyze_text_input(text: str, user: dict, last_meal_context: dict | None) ->
         "generationConfig": {"responseMimeType": "application/json"},
     }
     
-    response_json, fallback_notice = generate_content_with_fallback(payload, "テキスト解析", timeout=15)
+    response_json, fallback_notice = generate_content_with_fallback(
+        payload, "テキスト解析", timeout=TEXT_GEMINI_BUDGET, per_model_timeout=TEXT_PER_MODEL_TIMEOUT
+    )
     result = parse_text_intent_result(response_json, allow_correction=last_meal_context is not None)
     if fallback_notice:
         result["_gemini_fallback_notice"] = fallback_notice
@@ -1041,7 +1131,7 @@ async def process_text_meal_or_chat(event, user_id, user, text):
     
     task = asyncio.create_task(analyze())
     try:
-        result = await asyncio.wait_for(asyncio.shield(task), timeout=12)
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=TEXT_TOTAL_TIMEOUT)
         await asyncio.to_thread(_deliver_text_analysis_result, reply_token, user_id, user, result, is_push=False)
     except asyncio.TimeoutError:
         logger.warning(f"テキスト解析がタイムアウト: user_id={user_id}, text={text[:50]}")
@@ -1147,7 +1237,28 @@ def fetch_line_image(message_id):
     except urllib.error.URLError as exc:
         raise RuntimeError("LINEから画像を取得できませんでした。") from exc
 
-GEMINI_MAX_RETRIES = 2  # 503（Google側の一時的な過負荷）のときだけ、1モデルあたりこの回数までリトライする
+# 【軽量化】以前は503のとき同一モデル内で2秒→4秒とsleepしてリトライしていたが、
+# 無料枠運用では候補モデルそれぞれが独立したレート制限枠を持っているため、
+# 同じモデルを待つより次の候補モデルに即座に回した方が速く、かつ枠の無駄遣いも防げる。
+# そのためリトライ回数を1（＝リトライしない）に変更し、sleepによる遅延を無くす。
+GEMINI_MAX_RETRIES = 1
+
+# --- LINEの応答トークンを意識した時間予算 ---
+# LINEの応答トークンはWebhook受信から1分以内に使う必要がある（公式仕様）。
+# Webhook受信はCloudflare Workers側で行われるため、そこからRenderに届くまでの
+# ネットワーク往復や、Sheets読み書きの時間も1分の中に含まれる。安全マージンを取り、
+# Render側で使ってよい時間の上限を以下のように設定する。
+# ・TEXT/IMAGE_TOTAL_TIMEOUT: 「ここまでに返信できなければPushに切り替える」外側の上限
+# ・TEXT/IMAGE_GEMINI_BUDGET: そのうちGemini呼び出し（フォールバック全体）に使ってよい時間
+# ・TEXT/IMAGE_PER_MODEL_TIMEOUT: 1モデルあたりの上限（これで頭打ちしつつ、
+#   残り予算が少なければさらに短く切り上げる＝deadline方式、詳細はgenerate_content_with_fallback）
+TEXT_TOTAL_TIMEOUT = 22
+TEXT_GEMINI_BUDGET = 16
+TEXT_PER_MODEL_TIMEOUT = 6
+
+IMAGE_TOTAL_TIMEOUT = 28
+IMAGE_GEMINI_BUDGET = 22
+IMAGE_PER_MODEL_TIMEOUT = 8
 
 class GeminiModelUnavailableError(RuntimeError):
     """特定のモデルが今回使えなかったことを表す（503のリトライ上限到達、429のレート制限、
@@ -1214,8 +1325,10 @@ def call_gemini_with_retry(model, payload, action_label, timeout=30, max_retries
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             if exc.code == 503:
+                # 【軽量化】以前はここでsleepしてから同じモデルへ再試行していたが、
+                # 無料枠は候補モデルごとに別枠なので、待つより次の候補へ即座に回す方が速い。
+                # max_retries=1（デフォルト）のときはこの分岐は実質1回で即フォールバックへ抜ける。
                 if attempt < max_retries - 1:
-                    time.sleep(2 ** (attempt + 1))  # 2秒→4秒と待機時間を伸ばしながら再試行
                     continue
                 raise GeminiModelUnavailableError(model, "HTTP 503：リトライ上限に到達") from exc
             if exc.code == 429:
@@ -1295,24 +1408,43 @@ def call_groq_vision(image_bytes, mime_type):
     except Exception as exc:
         raise RuntimeError(f"Groq Visionの解析に失敗しました。詳細: {exc}") from exc
 
-def generate_content_with_fallback(payload, action_label, timeout=30, image_bytes=None, mime_type=None, user_id=None):
+def generate_content_with_fallback(
+    payload, action_label, timeout=30, image_bytes=None, mime_type=None, user_id=None,
+    per_model_timeout=None,
+):
     """Geminiの候補モデルを順番に試し、全モデルが利用不可だった場合だけ
     （画像解析なら）Groq Visionへフォールバックする。
 
     【重要】以前のバージョンではこの関数の前半（Geminiループと attempts の初期化）が
     まるごと欠落しており、常にGroqへ直行した上に `attempts` 未定義のNameErrorで
     そのGroq経路自体も落ちる、という状態になっていた。ここで実装を復元する。
+
+    【軽量化・deadline方式】以前は「1モデルあたりtimeout秒」を候補モデルの数だけ
+    単純に足し合わせる設計だったため、候補が3〜4個あると最悪ケースで
+    LINEの応答トークンの猶予（Webhook受信から1分）を軽く超えてしまっていた。
+    ここでは `timeout` を「このフォールバック連鎖全体で使ってよい合計時間（予算）」として扱い、
+    各モデルの呼び出し時間は「残り予算」と「1モデルあたりの上限(per_model_timeout)」の
+    どちらか小さい方に動的に切り詰める。これにより、候補モデルが何個増えても
+    合計の最悪ケース時間は timeout 秒を超えない。
     """
     models = _gemini_models_to_try()
     attempts = []
     last_exc = None
+    per_model_timeout = per_model_timeout or timeout
+    deadline = time.monotonic() + timeout
+    MIN_USEFUL_TIMEOUT = 2.0  # これを下回る残り予算ではAPIを叩いても無駄になりやすいのでスキップ
 
     # 1. Geminiの候補モデルを順番に試す。
     #    GeminiModelUnavailableError（503リトライ上限／429レート制限／404／400）のときだけ
     #    次の候補モデルへ進む。それ以外の例外（通信エラー等のRuntimeError）はここで打ち切る。
     for model in models:
+        remaining = deadline - time.monotonic()
+        if remaining < MIN_USEFUL_TIMEOUT:
+            attempts.append((model, "スキップ（時間予算切れ）"))
+            continue
+        this_timeout = min(per_model_timeout, remaining)
         try:
-            response_json = call_gemini_with_retry(model, payload, action_label, timeout=timeout)
+            response_json = call_gemini_with_retry(model, payload, action_label, timeout=this_timeout)
             attempts.append((model, "成功"))
             notice = None
             if len(attempts) > 1:
@@ -1389,9 +1521,10 @@ def analyze_image(image_bytes, mime_type, user_id=None):
     }
     # 【修正】user_idを引数に追加して渡す
     response_json, fallback_notice = generate_content_with_fallback(
-        payload, 
-        "解析", 
-        timeout=30, 
+        payload,
+        "解析",
+        timeout=IMAGE_GEMINI_BUDGET,
+        per_model_timeout=IMAGE_PER_MODEL_TIMEOUT,
         image_bytes=image_bytes,
         mime_type=mime_type,
         user_id=user_id  # ← 追加
@@ -1538,7 +1671,7 @@ async def process_image_event(event):
     task = asyncio.create_task(get_and_analyze())
     try:
         
-        result = await asyncio.wait_for(asyncio.shield(task), timeout=15)
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=IMAGE_TOTAL_TIMEOUT)
         message = await asyncio.to_thread(save_analysis_and_build_message, user_id, user, result)
         await asyncio.to_thread(send_reply_with_quick_replies_sync, reply_token, message)
         

@@ -170,21 +170,35 @@ def save_user(user_id: str, status: str, updates: dict[str, Any] | None = None) 
     if row_number is None:
         # 新規行追加：optional_keysを渡して後方互換性を確保
         _append_by_header("users", sheet_values, optional_keys=_OPTIONAL_USER_COLUMNS)
+        # 新規行の場合、書き込んだ値がそのまま全データ（他の列は空欄）になる。
+        final_row_raw = {header: "" for header in headers}
+        final_row_raw.update({k: v for k, v in sheet_values.items() if k in headers})
     else:
         # 行全体を読んで、変更する列だけを上書きする。
+        # 【注意】_sheet_safe()で数式インジェクション対策の先頭アポストロフィを付けた文字列は
+        # 「実際にシートに書き込む用」の一時変数(existing)にだけ使い、戻り値の組み立てには
+        # 使わない（アポストロフィはGoogle Sheets側で書式指定として解釈され実際のセル値には
+        # 残らないため、ここでraw値のまま保持しないとget_user()の結果と食い違ってしまう）。
         existing = all_rows[row_number - 1]
         existing += [""] * (len(headers) - len(existing))
+        final_row_raw = dict(zip(headers, existing))  # 書き込み前の生値ベース
         for column, value in sheet_values.items():
             if column not in headers:
                 if column in _OPTIONAL_USER_COLUMNS:
                     continue  # 列が未追加なら黙ってスキップ（後方互換）
                 raise RuntimeError(f"usersシートに必要な列がありません: {column}")
             existing[headers.index(column)] = _sheet_safe(value)
+            final_row_raw[column] = value  # 戻り値用には生の値を反映
         sheet.update(f"A{row_number}", [existing])
-    
-    saved = get_user(user_id)
-    if saved is None:
-        raise RuntimeError("usersシートへの保存後にユーザーを読み取れませんでした。")
+
+    # 【軽量化】以前はここで get_user(user_id) を呼び、usersシートを丸ごと
+    # もう一度読み直していた（＝1回のsave_userにつきSheets読み取りAPIをもう1回消費）。
+    # 今書き込んだ値は手元の final_row_raw に既にあるので、シート全体の再読み込みは行わず
+    # その場でUSER_COLUMNS形式の辞書に組み立てて返す。
+    saved = {
+        internal: final_row_raw.get(sheet_column, "")
+        for internal, sheet_column in USER_COLUMNS.items()
+    }
     return saved
 
 MICRONUTRIENT_COLUMNS = {
@@ -334,9 +348,19 @@ def update_last_log(
         "potassium": potassium,
         "calcium": calcium,
     }
+    # 【軽量化】以前はここで列ごとに update_cell() を個別に呼んでおり、
+    # 微量栄養素9項目＋主要項目を合わせると1回の修正で最大13回もの
+    # 書き込みAPIコールが発生していた（無料枠のクォータ・応答速度の両方を圧迫する）。
+    # gspreadのbatch_update()で1回のAPI呼び出しにまとめる。
+    # 列が連続しているとは限らないため、セル単位のrange指定を複数まとめて1リクエストにする。
+    batch_data = []
     for column, value in updates.items():
         if column in headers:
-            sheet.update_cell(row_number, headers.index(column) + 1, _sheet_safe(value))
+            col_index = headers.index(column) + 1  # 1-indexed
+            a1 = gspread.utils.rowcol_to_a1(row_number, col_index)
+            batch_data.append({"range": a1, "values": [[_sheet_safe(value)]]})
+    if batch_data:
+        sheet.batch_update(batch_data, value_input_option="USER_ENTERED")
     return True
 
 def save_push_log(user_id: str, reason: str) -> None:
