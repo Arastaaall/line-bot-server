@@ -14,3 +14,19 @@ class_name = "DailyLimitCounter"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["DailyLimitCounter"]
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+redact_query_string = false
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
