@@ -142,6 +142,23 @@ async def internal_image_webhook(req: InternalImageRequest):
     return {"status": "accepted"}
 
 # --- バリデーション関数 ---
+_NO_MEAL_MENU_MARKERS = {
+    "", "none", "null", "n/a", "na", "unknown",
+    "不明", "なし", "特になし", "食事なし", "該当なし",
+}
+
+def _looks_like_no_meal(menu_name) -> bool:
+    """Geminiの抽出結果が『実際には食事内容が読み取れなかった』ことを示しているかどうかを判定する。
+    【修正】以前はここでのチェックが存在せず、雑談メッセージ等がWorkers側の判定ミス・タイムアウトで
+    force_intent=meal_add のままRenderへ渡ってくると、Geminiが「食事ではない」と分かっていても
+    menu_name=None・calories=0で無理やり体裁を整えて返し、それがそのまま0kcalの食事ログとして
+    スプレッドシートに保存されてしまっていた（実例：「こんにちは」が【食事記録】として記録された）。
+    """
+    if menu_name is None:
+        return True
+    normalized = str(menu_name).strip().lower()
+    return normalized in _NO_MEAL_MENU_MARKERS
+
 def validate_nutrition_data(data: dict) -> dict:
     """AI出力のバリデーション。不正な値は例外を投げるか、安全なデフォルトに丸める。"""
     if not isinstance(data, dict):
@@ -432,13 +449,15 @@ def analyze_text_for_extraction(text: str, user: dict, last_meal_context: dict |
     直前の食事: {last_meal_context}
     
     上記の入力から食事の内容を抽出し、JSONで返してください。
-    Intentは "{force_intent}" として処理してください。
+    Intentは基本的に "{force_intent}" として処理してください。
+    ただし、入力内容が挨拶・雑談・質問など、明らかに食事の記録や修正ではない場合は、
+    無理に食事として扱わず、menu_nameをnullにしてください。
     出力形式:
     {{
       "menu_name": "...", "calories": 数値, "protein": 数値, "fat": 数値, "carbs": 数値,
       "fiber": 数値, "vitamins": 数値, "vit_a": 数値, "vit_c": 数値, "zinc": 数値,
       "magnesium": 数値, "iron": 数値, "potassium": 数値, "calcium": 数値,
-      "suggestion": "アドバイス"
+      "suggestion": "アドバイス（食事でない場合は、ユーザーへの通常の返信メッセージ）"
     }}
     微量栄養素は推定値で構いません（数値のみ、単位なし）。
     """
@@ -455,6 +474,17 @@ def analyze_text_for_extraction(text: str, user: dict, last_meal_context: dict |
     try:
         raw_text = response_json["candidates"][0]["content"]["parts"][0]["text"]
         data = json.loads(raw_text[raw_text.find("{"):raw_text.rfind("}")+1])
+
+        # 【修正】食事内容が実際には読み取れなかった場合（menu_nameがnull/空/"None"など）は、
+        # 数値をでっち上げて0kcalの食事記録として保存するのではなく、雑談としてそのまま返信する。
+        # calories等のバリデーション前にチェックすることで、無効なmenu_nameのまま
+        # validate_nutrition_dataを通す必要がなくなる。
+        if _looks_like_no_meal(data.get("menu_name")):
+            reply = str(data.get("suggestion") or "").strip()
+            if not reply:
+                reply = "こんにちは！お食事の内容を教えていただければ、栄養素を計算してアドバイスします。"
+            return {"type": "chat", "reply": reply}
+
         validated_data = validate_nutrition_data(data)
         
         result = {
@@ -961,6 +991,15 @@ def parse_text_intent_result(response_json: dict, *, allow_correction: bool) -> 
         required = {"menu_name", "calories", "protein", "fat", "carbs", "suggestion"}
         if not required.issubset(data):
             raise ValueError("食事データに必要な項目がありません")
+
+        # 【修正】intentがmeal_add/meal_correctionと判定されていても、menu_nameが
+        # 実質「食事なし」を示す場合は、0kcalの記録を作らず雑談として返す
+        # （analyze_text_for_extractionの_looks_like_no_mealと同じ考え方）。
+        if _looks_like_no_meal(data.get("menu_name")):
+            reply = str(data.get("suggestion") or "").strip()
+            if not reply:
+                reply = "すみません、食事の内容をうまく読み取れませんでした。もう一度教えてください。"
+            return {"type": "chat", "reply": reply}
         
         # コード側の最終ガード：許可されていないのにmeal_correctionが来たらmeal_addに倒す
         if intent == "meal_correction" and not allow_correction:
@@ -1555,6 +1594,14 @@ def parse_analysis_result(response_json):
         required = {"menu_name", "calories", "protein", "fat", "carbs", "suggestion"}
         if first_brace < 0 or last_brace < first_brace or not required.issubset(data):
             raise ValueError("必要な項目がありません")
+
+        # 【修正】食事の写真ではない画像（スクリーンショット等）が送られた場合に、
+        # menu_name=None・0kcalのままログとして保存されてしまうのを防ぐ。
+        # ここで例外にしておけば、既存のexcept節が「保存しない・ユーザーへ通知」を
+        # そのまま行ってくれる。
+        if _looks_like_no_meal(data.get("menu_name")):
+            raise ValueError("画像から食事内容を検出できませんでした")
+
         result = {
             "menu_name": str(data["menu_name"]).strip(),
             "calories": round(float(data["calories"])),

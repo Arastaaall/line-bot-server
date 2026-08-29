@@ -284,22 +284,36 @@ You are a diet assistant. Classify the user input into one of: "chat", "meal_add
 - "chat": General conversation, greetings, questions not about specific meal logging.
 - "meal_add": User wants to log a new meal.
 - "meal_correction": User wants to correct the previous meal log.
-If "chat", provide a friendly reply in Japanese.
-If "meal_add" or "meal_correction", set reply to null.
-Output ONLY valid JSON: {"intent": "...", "reply": "..."}
+If "chat", provide a friendly reply in Japanese in the "reply" field.
+If "meal_add" or "meal_correction", set "reply" to an empty string.
 Input: "${text.replace(/"/g, '\\"')}"
 `;
 
-  // 【修正】以前はタイムアウト指定が無く、Workers AIが遅延した場合に
-  // どれだけ待つか不定だった。ここで明示的に4秒で切り上げ、失敗時は
-  // 即座にRender側のフォールバック判定（intent: null）に委ねる。
+  // 【修正】以前は自由記述のテキストから正規表現で { ... } を抜き出してJSON.parseしていたが、
+  // モデル（特に-fast版）が指示に従わずコードフェンス（```json ... ```）や前置きの文章を
+  // 付けて返すことがあり、そのままJSON.parseが失敗していた（今回報告されたエラーそのもの）。
+  // Workers AIのJSON Mode（response_format）でスキーマを強制し、モデル側で
+  // 構造化されたJSONしか返させないようにする。これにより解析失敗そのものを減らす。
   const response = await fetch(url, {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${env.CF_API_TOKEN}`,
       "Content-Type": "application/json"
     },
-    body: JSON.stringify({ prompt }),
+    body: JSON.stringify({
+      prompt,
+      response_format: {
+        type: "json_schema",
+        json_schema: {
+          type: "object",
+          properties: {
+            intent: { type: "string", enum: ["chat", "meal_add", "meal_correction"] },
+            reply: { type: "string" },
+          },
+          required: ["intent", "reply"],
+        },
+      },
+    }),
     signal: AbortSignal.timeout(4000),
   });
 
@@ -307,14 +321,25 @@ Input: "${text.replace(/"/g, '\\"')}"
   
   const result = await response.json();
   // Workers AI のレスポンス構造からテキスト抽出
-  const rawText = result.result?.response || "";
-  
+  const rawText: string = result.result?.response || "";
+
+  // 【修正】JSON Modeを使っていてもモデルがコードフェンスを付けてくることがあるため、
+  // 念のため ```json / ``` を取り除いてから解析する（多層の防御）。
+  const cleaned = rawText.replace(/```json|```/g, "").trim();
+
   // JSON抽出
-  const match = rawText.match(/\{[\s\S]*\}/);
-  if (match) {
-    return JSON.parse(match[0]);
+  const match = cleaned.match(/\{[\s\S]*\}/);
+  if (!match) {
+    throw new Error(`Invalid JSON from AI（本文が見つからない）: ${rawText.slice(0, 200)}`);
   }
-  throw new Error("Invalid JSON from AI");
+  try {
+    return JSON.parse(match[0]);
+  } catch (e) {
+    // 【修正】以前はJSON.parseの失敗理由が分からず、"Workers AI Error"としか
+    // ログに残らなかった。実際に届いた本文を一緒に残すことで、次に同じ失敗が
+    // 起きたときに原因（コードフェンス、途中で切れた等）をすぐ判断できるようにする。
+    throw new Error(`Invalid JSON from AI（parse失敗: ${(e as Error).message}）: ${match[0].slice(0, 200)}`);
+  }
 }
 
 async function checkAndIncrementDailyLimit(userId: string, env: Env): Promise<boolean> {
