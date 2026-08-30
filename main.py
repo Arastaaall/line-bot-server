@@ -2,6 +2,7 @@ import nest_asyncio
 nest_asyncio.apply()
 
 import os
+import re
 import asyncio
 import base64
 import json
@@ -34,6 +35,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+CHAT_GUIDANCE = "食べたものがあれば、気軽に教えてくださいね。写真でも大丈夫です。"
 
 # 【修正】app はここで先に生成する。
 # 以前は下の方（旧218行目付近）で定義されており、それより前にある
@@ -531,8 +534,8 @@ def analyze_text_for_extraction(text: str, user: dict, last_meal_context: dict |
         if _looks_like_no_meal(data.get("menu_name")):
             reply = str(data.get("suggestion") or "").strip()
             if not reply:
-                reply = "こんにちは！お食事の内容を教えていただければ、栄養素を計算してアドバイスします。"
-            return {"type": "chat", "reply": reply}
+                reply = "こんにちは！食べたものを教えていただければ、栄養素を計算してアドバイスしますね。"
+            return {"type": "chat", "reply": reply, "_source_text": text}
 
         validated_data = validate_nutrition_data(data)
         
@@ -553,7 +556,11 @@ def analyze_text_for_extraction(text: str, user: dict, last_meal_context: dict |
     except Exception as e:
         # バリデーション失敗時はエラーログに出し、雑談扱いにして逃がす
         sheets.save_error_log(user["user_id"], "validate_nutrition_data", str(e))
-        return {"type": "chat", "reply": "申し訳ありません。数値の解析に失敗しました。"}
+        return {
+            "type": "chat",
+            "reply": "申し訳ありません。うまく読み取れませんでした。食べたものをもう一度教えてくださいね。",
+            "_source_text": text,
+        }
 
 @app.api_route("/ping", methods=["GET", "HEAD"], response_class=PlainTextResponse)
 async def ping():
@@ -999,6 +1006,10 @@ def analyze_text_input(text: str, user: dict, last_meal_context: dict | None) ->
         "微量栄養素は推定値で構いません（数値のみ、単位なし）。\n\n"
         "食事に関係ない場合：\n"
         '{ "intent": "chat", "reply": "ユーザーへの返信メッセージ" }\n'
+        "chatの返信は、相手の気持ちを短く受け止める温かく自然な日本語にしてください。"
+        "冷たい事務的な表現、「気分を害したくない」などの自己防衛的な表現、入力のオウム返しは避けてください。"
+        "会話を長引かせる質問はせず、質問する場合も食事の記録や栄養相談に直結するものを1つまでにしてください。"
+        "最後は、押しつけがましくならないよう食べたものの記録や栄養相談へ自然に案内してください。\n"
         + MEDICAL_GUARDRAIL
     )
     
@@ -1011,6 +1022,7 @@ def analyze_text_input(text: str, user: dict, last_meal_context: dict | None) ->
         payload, "テキスト解析", timeout=TEXT_GEMINI_BUDGET, per_model_timeout=TEXT_PER_MODEL_TIMEOUT
     )
     result = parse_text_intent_result(response_json, allow_correction=last_meal_context is not None)
+    result["_source_text"] = text
     if fallback_notice:
         result["_gemini_fallback_notice"] = fallback_notice
     result["_today_logs_before"] = today_logs
@@ -1095,6 +1107,29 @@ def _log_fallback_notice_if_any(user_id, result):
         # 通知ログの保存に失敗しても、本来の返信処理は止めない。
         pass
 
+def _prepare_chat_reply(user_text, reply_text):
+    """雑談返信を短く自然に整え、本来機能への案内を重複なく付ける。"""
+    user_text = str(user_text or "").strip()
+    body = str(reply_text or "").strip()
+    placeholder = {"日本語の返信", "ユーザーへの返信メッセージ", "返信メッセージ"}
+    prompt_leak = re.search(
+        r"あなたは日本語の食事管理アシスタント|You are a diet assistant|conversation_history|current_user_input|meal_add|meal_correction",
+        body,
+        re.IGNORECASE,
+    )
+    cold_meta = re.search(r"気分を害したくない|こちらの立場からも|できるだけ簡潔に返事", body)
+    if not body or body in placeholder or body == user_text or prompt_leak or cold_meta:
+        body = "ありがとうございます。食事の記録や栄養相談をお手伝いします。"
+
+    # Workers側の旧案内文がフォールバック結果に混ざっても二重表示しない。
+    body = body.replace("食事の記録や栄養相談は、写真か食べたものを送ってください。", "").strip()
+    body = body or "ありがとうございます。"
+    has_nutrition_invitation = (
+        re.search(r"食事の記録|食べたもの|栄養相談|メニュー|写真", body)
+        and re.search(r"教えて|送って|記録|相談|ください|できます|大丈夫", body)
+    )
+    return body if has_nutrition_invitation else f"{body}\n\n{CHAT_GUIDANCE}"
+
 def _deliver_text_analysis_result(reply_token, user_id, user, result, *, is_push):
     """Geminiのテキスト解析結果（食事 or 雑談）を保存し、適切な経路で届ける。
 
@@ -1108,7 +1143,7 @@ def _deliver_text_analysis_result(reply_token, user_id, user, result, *, is_push
         today_logs_before = result.pop("_today_logs_before", None)
         
         if intent == "chat":
-            message = result["reply"]
+            message = _prepare_chat_reply(result.pop("_source_text", ""), result.get("reply", ""))
             if is_push:
                 logger.warning("雑談返信はReply専用のため、Push送信を行わず終了します: user_id=%s", user_id)
                 return
