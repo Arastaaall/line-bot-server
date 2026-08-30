@@ -36,7 +36,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-CHAT_GUIDANCE = "食べたものがあれば、気軽に教えてくださいね😊 写真でも大丈夫ですよ。"
+# 生成結果が空・placeholder・プロンプト漏洩などになった場合だけ使う案内。
+# 正常な雑談返信へ毎回追加しない（話題と無関係な記録催促を防ぐ）。
+CHAT_GUIDANCE = "食事の記録や栄養相談があれば、いつでも気軽に声をかけてくださいね。"
 
 # 【追加】「使い方」「カロリー確認」「振り返り」は完全一致の文言だけでなく、
 # 「トータルカロリーの確認」のような言い回しでも確実に固定コマンドとして
@@ -1023,7 +1025,8 @@ def analyze_text_input(text: str, user: dict, last_meal_context: dict | None) ->
         "2. 話題に自然につながる一言を添えてもよい（関係のない情報は割り込ませない）。\n"
         "3. 食事・飲み物・体調など記録に自然につながる話題のときだけ、押しつけがましくならない範囲で"
         "「写真を送ってくれれば記録できますよ」のように軽く思い出させる。関係が薄い話題では毎回付けなくてよい。\n"
-        "絵文字は😊🍵📷️☺️💪🥶☔️のような温かい印象のものを、多くても1〜2個までなら使ってよい（無理に使わなくてもよい）。\n"
+        "関係の薄い話題では2までで止め、固定の記録案内文を毎回付けないでください。\n"
+        "絵文字は必要な場合だけ0〜1個まで使ってよく、無理に使わないでください。同じ絵文字を繰り返し多用しないでください。\n"
         "冷たい事務的な表現、「気分を害したくない」などの自己防衛的な表現、入力のオウム返しは避けてください。"
         "会話を長引かせる質問はせず、相手が自然に会話を終えられる締めくくりにしてください。\n"
         "意味の読み取りにくい入力には、問い詰めたり不自然に聞き返したりせず、軽く受け流してから短く本来の話題へつなげてください。\n"
@@ -1125,7 +1128,7 @@ def _log_fallback_notice_if_any(user_id, result):
         pass
 
 def _prepare_chat_reply(user_text, reply_text):
-    """雑談返信を短く自然に整え、本来機能への案内を重複なく付ける。"""
+    """雑談返信を短く自然に整え、必要な場合だけ安全な案内を返す。"""
     user_text = str(user_text or "").strip()
     body = str(reply_text or "").strip()
     placeholder = {"日本語の返信", "ユーザーへの返信メッセージ", "返信メッセージ"}
@@ -1139,13 +1142,9 @@ def _prepare_chat_reply(user_text, reply_text):
         body = "ありがとうございます。食事の記録や栄養相談をお手伝いします。"
 
     # Workers側の旧案内文がフォールバック結果に混ざっても二重表示しない。
-    body = body.replace("食事の記録や栄養相談は、写真か食べたものを送ってください。", "").strip()
-    body = body or "ありがとうございます。"
-    has_nutrition_invitation = (
-        re.search(r"食事の記録|食べたもの|栄養相談|メニュー|写真", body)
-        and re.search(r"教えて|送って|記録|相談|ください|できます|大丈夫", body)
-    )
-    return body if has_nutrition_invitation else f"{body}\n\n{CHAT_GUIDANCE}"
+    body = body.replace("食事の記録や栄養相談は、写真か食べたものを送ってください。", "")
+    body = body.replace("食べたものがあれば、気軽に教えてくださいね😊 写真でも大丈夫ですよ。", "").strip()
+    return body or f"ありがとうございます。{CHAT_GUIDANCE}"
 
 def _deliver_text_analysis_result(reply_token, user_id, user, result, *, is_push):
     """Geminiのテキスト解析結果（食事 or 雑談）を保存し、適切な経路で届ける。

@@ -38,7 +38,13 @@ const PLACEHOLDER_REPLIES = new Set([
 const JST_TIME_ZONE = "Asia/Tokyo";
 const CHAT_CONTEXT_MAX_TURNS = 8;
 const CHAT_CONTEXT_MAX_TEXT_LENGTH = 600;
-const CHAT_GUIDANCE = "食べたものがあれば、気軽に教えてくださいね😊 写真でも大丈夫ですよ。";
+const CHAT_GUIDANCE = "食事の記録や栄養相談があれば、いつでも気軽に声をかけてくださいね。";
+
+function pickChatVariant(variants: string[]): string {
+  const random = new Uint32Array(1);
+  crypto.getRandomValues(random);
+  return variants[random[0] % variants.length];
+}
 
 function formatError(error: unknown): string {
   if (error instanceof Error) return `${error.name}: ${error.message}`;
@@ -94,52 +100,103 @@ function looksLikeMealCorrection(text: string): boolean {
 function getDeterministicChatReply(text: string): { reply: string; rule: string } | null {
   const normalized = text.trim();
   if (/^(こんにちは|こんばんは|おはよう(?:ございます)?|お疲れさま(?:です)?|よろしく(?:お願いします)?|やあ|どうも)[\s　!！。、.]*$/i.test(normalized)) {
-    return { reply: "こんにちは！😊 今日も元気にいきましょう。食事をしたら、写真📷️を送ってくれれば記録しますよ！", rule: "greeting" };
+    return {
+      reply: pickChatVariant([
+        "こんにちは！今日も元気にいきましょう😊",
+        "こんにちは！来てくださってありがとうございます。",
+        "こんにちは。今日も無理なくいきましょうね。",
+      ]),
+      rule: "greeting",
+    };
+  }
+
+  if (/(おやすみ|もう寝たい|眠い|寝ます)/.test(normalized)) {
+    return {
+      reply: pickChatVariant([
+        "おやすみなさい。今日はゆっくり休んでくださいね。",
+        "お疲れさまでした。あたたかくして、ゆっくりお休みください。",
+      ]),
+      rule: "bedtime",
+    };
   }
 
   if (/(あなたについて|私じゃなくてあなた|あなたはどんな(?:こと|事)|あなたはどういうことができる|君はどんなことができる|何ができる|できること)/.test(normalized)) {
     return {
-      reply: "食べたものの記録やカロリー・栄養の確認、直前の記録の訂正をお手伝いできますよ😊 気軽にメニューを教えてくださいね。",
+      reply: pickChatVariant([
+        "食べたものの記録やカロリー・栄養の確認、直前の記録の訂正をお手伝いできます。食事のことなら気軽に相談してくださいね。",
+        "私は食事の記録、栄養の確認、直前の記録の訂正をお手伝いします。メニューを教えていただければ、カロリーも確認できますよ。",
+      ]),
       rule: "assistant_capability",
     };
   }
 
   if (/(正しくは私|あなたは.*という|主語|言い方が違)/.test(normalized)) {
     return {
-      reply: "ご指摘ありがとうございます。言い方が硬くなってしまいました。私は食事管理を支援するアシスタントです。",
+      reply: pickChatVariant([
+        "ご指摘ありがとうございます。言い方が硬くなってしまいました。これからはもう少し自然にお話ししますね。",
+        "教えてくださってありがとうございます。たしかに表現が不自然でした。自然でわかりやすくお答えしますね。",
+      ]),
       rule: "assistant_correction",
     };
   }
 
   if (/(あなたの会話性能|テストとして|会話性能|日本語.*(?:対応|性能|質).*(?:試|確認)|会話.*(?:試|テスト)|テスト|試み|試して|確認している)/.test(normalized)) {
     return {
-      reply: "テストありがとうございます😊 短いやり取りでも、できるだけ自然にお返ししますね。食べたものがあれば記録できますよ。",
+      reply: pickChatVariant([
+        "テストありがとうございます。できるだけ自然にお返ししますね。",
+        "試してくださってありがとうございます。気になるところがあれば、遠慮なく教えてくださいね。",
+      ]),
       rule: "test_feedback",
     };
   }
 
   if (/^例えばどんな[？?]?$/.test(normalized)) {
     return {
-      reply: "食事の記録追加、直前の記録の訂正、栄養相談ができます。まずは食べたものを教えてくださいね。",
+      reply: "食事の記録追加、直前の記録の訂正、栄養相談ができます。食べたものがあれば教えてくださいね。",
       rule: "feature_example",
+    };
+  }
+
+  if (/^(すごい(?:ね)?|いいね|助かる(?:ね)?|ありがとう(?:ございます)?)[\s　!！。、.]*$/i.test(normalized)) {
+    return {
+      reply: pickChatVariant([
+        "ありがとうございます！そう言っていただけてうれしいです。",
+        "うれしいです！これからも食事管理のお手伝いをしますね。",
+      ]),
+      rule: "positive_feedback_general",
     };
   }
 
   if (/(?:処理|返信|会話).*(?:うまく(?:い|行)ってる|正常|成功|直った|戻った)|うまく(?:い|行)ってるね/.test(normalized)) {
     return {
-      reply: "ありがとうございます！💪 うまく動いているようで安心しました。次は食べたものを送っていただければ、記録できますよ。",
+      reply: pickChatVariant([
+        "ありがとうございます！うまく動いているようで安心しました。",
+        "よかったです！確認してくださってありがとうございます。",
+      ]),
       rule: "positive_feedback",
     };
   }
 
   if (/(涼し|過ごしやす|暑|寒|雨|晴れ|天気|蒸し)/.test(normalized)) {
     const reply = /雨/.test(normalized)
-      ? "本当に雨が続くと気分も少し沈みがちですよね☔️ 温かいものでも食べて、ゆっくり過ごしてくださいね。よければ記録もしておきますよ。"
+      ? pickChatVariant([
+          "雨が続くと、少し気分も沈みがちですよね。今日はゆっくり過ごしてくださいね☔️",
+          "雨の日が続きますね。あたたかくして、無理せず過ごしましょう。",
+        ])
       : /寒/.test(normalized)
-        ? "本当に少し寒くなってきましたね🥶 温かいものを食べたら、よければ記録してくださいね。"
-        : /暑|蒸し/.test(normalized)
-          ? "暑い日が続きますね💦 水分もとりつつ、食べたものがあれば気軽に教えてくださいね。"
-          : "そうですね、少し過ごしやすい日ですね☺️ 食べたものがあれば、気軽に教えてくださいね。";
+        ? pickChatVariant([
+            "最近冷えますね。体を冷やさないように、温かいスープでもいかがですか？",
+            "寒くなってきましたね。温かいものを食べて、ゆっくり過ごしてくださいね。",
+          ])
+      : /暑|蒸し/.test(normalized)
+          ? pickChatVariant([
+              "暑い日が続きますね。水分をとって、無理せず過ごしてくださいね。",
+              "蒸し暑いですね。涼しくして、ひと息ついてくださいね。",
+            ])
+          : pickChatVariant([
+              "そうですね、少し過ごしやすい日ですね。",
+              "たしかに、今日は過ごしやすそうですね。ゆっくりいきましょう。",
+            ]);
     return { reply, rule: "small_talk_weather" };
   }
 
@@ -148,7 +205,10 @@ function getDeterministicChatReply(text: string): { reply: string; rule: string 
   // Renderの詳しい案内文へ直接転送するため、このパターンからは除外している。
   if (/(おかしい|おかしく|変だ|変ですね|何も出てこない|何も表示されない|届かない|返信がない|返事がない|動かない|バグ|エラー|オウム返し|会話が成立しない|そっけない|トゲのある|冷たい)/.test(normalized)) {
     return {
-      reply: "そう感じさせてしまってすみません🙏 もう少し温かく、自然にお返ししますね。食事の記録や栄養相談があれば、気軽に教えてください。",
+      reply: pickChatVariant([
+        "そう感じさせてしまってすみません。もう少し自然で親しみのある返答を心がけますね。",
+        "ご指摘ありがとうございます。たしかに少しそっけなくなっていました。もう少しやわらかくお返ししますね。",
+      ]),
       rule: "chat_feedback",
     };
   }
@@ -190,18 +250,13 @@ function prepareChatReply(userText: string, replyText: string): string {
   const looksLikeColdMeta = /気分を害したくない|こちらの立場からも|できるだけ簡潔に返事/.test(normalizedReply);
   const isEcho = normalizedReply === userText.trim();
   const body = !normalizedReply || isPlaceholderReply(normalizedReply) || looksLikePromptLeak || looksLikeColdMeta || isEcho
-    ? "ありがとうございます。食事の記録や栄養相談をお手伝いします。"
+    ? `ありがとうございます。${CHAT_GUIDANCE}`
     : normalizedReply;
   const withoutOldGuidance = body
     .replace(/食事の記録や栄養相談は、写真か食べたものを送ってください。?/g, "")
+    .replace(/食べたものがあれば、気軽に教えてくださいね😊 写真でも大丈夫ですよ。?/g, "")
     .trim();
-  const safeBody = withoutOldGuidance || "ありがとうございます。";
-  const hasNutritionInvitation =
-    /(食事の記録|食べたもの|栄養相談|メニュー|写真)/.test(safeBody) &&
-    /(教えて|送って|記録|相談|ください|できます|大丈夫)/.test(safeBody);
-  return hasNutritionInvitation
-    ? safeBody
-    : `${safeBody}\n\n${CHAT_GUIDANCE}`;
+  return withoutOldGuidance || `ありがとうございます。${CHAT_GUIDANCE}`;
 }
 
 // --- Daily Limit用 Durable Object ---
@@ -733,8 +788,8 @@ meal_correctionは、直前の食事記録を訂正・置換したい入力で�
 chatの場合、次の考え方で会話履歴と現在の入力がつながる、温かく自然な日本語の返信を1〜2文で作ってください。
 1. まずユーザーの気持ちや話題に短く共感・反応してください（例:「最近寒いですよね」「お疲れさまでした」）。
 2. 話題に自然につながる一言（体調を気遣う、季節の一言など）を添えてもかまいません。話題と関係のない情報を割り込ませないでください。
-3. 食事・飲み物・体調など記録に自然につながる話題のときだけ、押しつけがましくならない範囲で「写真を送ってくれれば記録できますよ」のように軽く思い出させてください。話題との関係が薄いとき（相槌や指摘、天気だけの話など）は、毎回この案内を付ける必要はありません。
-絵文字は😊🍵📷️☺️💪🥶☔️のような温かい印象のものを、多くても1〜2個までなら使ってかまいません。無理に使う必要はありません。
+3. 食事・飲み物・体調など記録に自然につながる話題のときだけ、押しつけがましくならない範囲で話題に関連した記録方法を軽く思い出させてください。例えば「寒いですね。温かいスープでもいかがですか？」と書いた場合に限り、「飲んだら記録できますよ」と続けてもかまいません。話題との関係が薄いとき（挨拶、相槌、指摘、天気だけの話など）は、2までで止め、記録の案内を付けないでください。固定の案内文を毎回追加しないでください。
+絵文字は必要な場合だけ0〜1個まで使ってかまいません。無理に使わず、直前の返信と同じ絵文字を続けて使わないでください。
 丁寧すぎる定型文や冷たい事務的な表現は避けてください。現在の入力をそのまま繰り返さず、新しい話題を勝手に作らず、挨拶でない入力に挨拶だけを返さないでください。会話を続けるための質問はしないでください。相手が自然に会話を終えられるような締めくくりにし、必要以上にやり取りを長引かせないでください。「気分を害したくない」など、相手を責めるように受け取られる表現は使わないでください。
 意味の読み取りにくい入力（例: 意味のない文字の羅列）には、問い詰めたり不自然に聞き返したりせず、軽く受け流してから短く本来の話題へつなげてください。
 自分のことを説明するときは「私は」と書いてください。
