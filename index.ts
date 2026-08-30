@@ -139,6 +139,10 @@ async function processEventInner(event: any, env: Env) {
     if (messageType === "text") {
       await handleTextMessage(event, env);
     } else if (messageType === "image") {
+      // 【追加】画像はRender側の解析（最大約28秒）を待つ必要があるため、
+      // ここWorkers側で即座にローディングアニメーションを出しておく
+      // （Render側の show_loading_sync 呼び出しより一手早く表示できる）。
+      await showLoadingAnimation(userId, 30, env);
       // 画像は即Renderへプロキシ
       const ok = await proxyToRender(env, {
         endpoint: "/internal/image",
@@ -191,6 +195,14 @@ async function handleTextMessage(event: any, env: Env) {
     return;
   }
 
+  // 【追加】ここから先はGemini/Workers AIの呼び出しが絡み、数秒〜20秒程度かかりうる。
+  // 以前はここでLINEの「入力中...」ローディングアニメーションを一切出しておらず、
+  // ユーザーからは「本当に動いているのか」が分からなかった。
+  // Workers側（ユーザーの操作から一番近い場所）で先に表示しておくことで、
+  // この後Renderに処理を渡してからの待ち時間も含めてカバーする
+  // （LINEは実際に返信/Pushが送られると自動でアニメーションを終了する）。
+  await showLoadingAnimation(userId, 30, env);
+
   // 5. Workers AI による Intent 判定
   let intent = "meal_add"; // デフォルトは安全側（食事記録）
   let replyText = "";
@@ -211,12 +223,20 @@ async function handleTextMessage(event: any, env: Env) {
   // 6. Intent 分岐
   if (intent === "chat" && aiSuccess) {
     // 雑談判定時: Daily Limit チェック
-    const limitOk = await checkAndIncrementDailyLimit(userId, env);
-    if (!limitOk) {
-      await replyToLine(replyToken, "雑談機能は1日の利用回数が制限されています。食事の記録なら無制限でご利用いただけます。", env);
+    const limitResult = await checkAndIncrementDailyLimit(userId, env);
+    if (!limitResult.allowed) {
+      await replyToLine(
+        replyToken,
+        `雑談機能は1日の利用回数（${limitResult.limit}回）に達しました。食事の記録なら無制限でご利用いただけます。`,
+        env
+      );
       return;
     }
-    await replyToLine(replyToken, replyText || "こんにちは！", env);
+    // 【追加】「視覚的に見えるようにしてほしい」との要望に対応。
+    // 毎回の雑談返信の末尾に、本日あと何回使えるかを一言添える。
+    const remaining = Math.max(limitResult.limit - limitResult.count, 0);
+    const counterNote = `\n\n（本日の雑談: 残り${remaining}/${limitResult.limit}回）`;
+    await replyToLine(replyToken, (replyText || "こんにちは！") + counterNote, env);
   } else {
     // meal_add / meal_correction / AI失敗時 -> Render へプロキシ
     const ok = await proxyToRender(env, {
@@ -294,30 +314,44 @@ Input: "${text.replace(/"/g, '\\"')}"
   // 付けて返すことがあり、そのままJSON.parseが失敗していた（今回報告されたエラーそのもの）。
   // Workers AIのJSON Mode（response_format）でスキーマを強制し、モデル側で
   // 構造化されたJSONしか返させないようにする。これにより解析失敗そのものを減らす。
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${env.CF_API_TOKEN}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      prompt,
-      response_format: {
-        type: "json_schema",
-        json_schema: {
-          type: "object",
-          properties: {
-            intent: { type: "string", enum: ["chat", "meal_add", "meal_correction"] },
-            reply: { type: "string" },
-          },
-          required: ["intent", "reply"],
-        },
+  // 【修正】以前はタイムアウト(AbortError)もHTTPエラーも「AI API Error」という
+  // 中身のない文言でしか分からず、実際に何が起きたのかログから判断できなかった。
+  // ステータスコード・レスポンス本文・タイムアウトかどうかを区別して残す。
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.CF_API_TOKEN}`,
+        "Content-Type": "application/json"
       },
-    }),
-    signal: AbortSignal.timeout(4000),
-  });
+      body: JSON.stringify({
+        prompt,
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            type: "object",
+            properties: {
+              intent: { type: "string", enum: ["chat", "meal_add", "meal_correction"] },
+              reply: { type: "string" },
+            },
+            required: ["intent", "reply"],
+          },
+        },
+      }),
+      signal: AbortSignal.timeout(4000),
+    });
+  } catch (e) {
+    if (e instanceof Error && e.name === "TimeoutError") {
+      throw new Error("Workers AI タイムアウト（4秒以内に応答なし）");
+    }
+    throw new Error(`Workers AI fetch失敗: ${(e as Error).message}`);
+  }
 
-  if (!response.ok) throw new Error("AI API Error");
+  if (!response.ok) {
+    const bodyText = await response.text().catch(() => "");
+    throw new Error(`AI API Error: HTTP ${response.status} ${bodyText.slice(0, 300)}`);
+  }
   
   const result = await response.json();
   // Workers AI のレスポンス構造からテキスト抽出
@@ -342,19 +376,20 @@ Input: "${text.replace(/"/g, '\\"')}"
   }
 }
 
-async function checkAndIncrementDailyLimit(userId: string, env: Env): Promise<boolean> {
+async function checkAndIncrementDailyLimit(userId: string, env: Env): Promise<{ allowed: boolean; count: number; limit: number }> {
   // 【修正】KVでのGET→+1→PUTは同時アクセス時に競合する（例: 同一ユーザーから
   // ほぼ同時に2通来ると両方とも同じcurrent値を読み、上限を超えて許可されてしまう）。
   // ユーザーID×日付ごとに1つのDurable Objectインスタンスへ処理を委譲することで、
   // チェックと増加を原子的に行う。
-  const limit = env.DAILY_CHAT_LIMIT || "20";
+  const limit = parseInt(env.DAILY_CHAT_LIMIT || "20");
   const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
   const id = env.DAILY_LIMIT_DO.idFromName(`${userId}:${today}`);
   const stub = env.DAILY_LIMIT_DO.get(id);
 
   const response = await stub.fetch(`https://daily-limit/check?limit=${limit}`);
   const result = await response.json<{ allowed: boolean; count: number }>();
-  return result.allowed;
+  // 【追加】呼び出し側で「本日あと何回使えるか」を表示できるよう、countとlimitも返す。
+  return { allowed: result.allowed, count: result.count, limit };
 }
 
 async function proxyToRender(env: Env, data: { endpoint: string, payload: any }): Promise<boolean> {
@@ -406,6 +441,32 @@ async function replyToLine(replyToken: string, message: string, env: Env) {
       messages: [{ type: "text", text: message }]
     })
   });
+}
+
+async function showLoadingAnimation(userId: string, seconds: number, env: Env): Promise<void> {
+  // 【追加】LINEの「入力中...」ローディングアニメーションを表示するAPI。
+  // これは特定のreply_tokenではなくユーザー(chatId)単位の表示であり、
+  // 実際にメッセージ（reply/push）が送られると自動的に終了する。
+  // loadingSecondsは5〜60の間で5刻みである必要があるため、丸めておく。
+  const roundedSeconds = Math.min(60, Math.max(5, Math.round(seconds / 5) * 5));
+  try {
+    const res = await fetch("https://api.line.me/v2/bot/chat/loading/start", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}`
+      },
+      body: JSON.stringify({ chatId: userId, loadingSeconds: roundedSeconds }),
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!res.ok) {
+      const bodyText = await res.text().catch(() => "");
+      console.error(`showLoadingAnimation: HTTP ${res.status} ${bodyText.slice(0, 200)}`);
+    }
+  } catch (e) {
+    // 【重要】あくまで見た目の補助機能なので、ここで失敗しても本処理は止めない。
+    console.error("showLoadingAnimation failed:", e);
+  }
 }
 
 function getFixedCommandReply(text: string): string | null {
