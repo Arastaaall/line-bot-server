@@ -24,11 +24,21 @@ interface WorkersAIClassification {
 }
 
 const ALLOWED_INTENTS = new Set<Intent>(["chat", "meal_add", "meal_correction"]);
+const PLACEHOLDER_REPLIES = new Set([
+  "日本語の返信",
+  "ユーザーへの返信メッセージ",
+  "返信メッセージ",
+]);
 const JST_TIME_ZONE = "Asia/Tokyo";
 
 function formatError(error: unknown): string {
   if (error instanceof Error) return `${error.name}: ${error.message}`;
   return String(error);
+}
+
+function logEvent(event: string, fields: Record<string, unknown> = {}): void {
+  // 本文やユーザーIDはログへ出さず、処理経路だけを追える最小限の構造化ログにする。
+  console.log(JSON.stringify({ event, ...fields }));
 }
 
 function getDailyChatLimit(env: Env): number {
@@ -65,6 +75,14 @@ function getNextJstMidnightTimestamp(now = Date.now()): number {
 function truncateForLine(text: string, maxLength = 5000): string {
   if (text.length <= maxLength) return text;
   return `${text.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function looksLikeMealCorrection(text: string): boolean {
+  return /(じゃなくて|ではなくて|ではなく|代わりに|違いまし|間違い|訂正|修正|本当は|正しくは|さっき|先ほど|前の食事)/.test(text);
+}
+
+function isPlaceholderReply(text: string): boolean {
+  return PLACEHOLDER_REPLIES.has(text.trim());
 }
 
 // --- Daily Limit用 Durable Object ---
@@ -159,6 +177,7 @@ async function processEvent(event: any, env: Env) {
     await processEventInner(event, env);
   } catch (e) {
     console.error("processEvent failed:", formatError(e), e instanceof Error ? e.stack : "");
+    logEvent("line_event", { stage: "failed", error: formatError(e) });
     await notifyLine(
       replyToken,
       event?.source?.userId,
@@ -173,12 +192,19 @@ async function processEventInner(event: any, env: Env) {
   
   // 3. 重複配信排除 (KV使用)
   if (await isDuplicateEvent(eventId, env)) {
+    logEvent("line_event", { stage: "duplicate_ignored" });
     return;
   }
 
   const type = event.type;
   const replyToken = event.replyToken;
   const userId = event.source.userId;
+  logEvent("line_event", {
+    stage: "received",
+    type,
+    message_type: event.message?.type || null,
+    has_reply_token: Boolean(replyToken),
+  });
 
   if (type === "follow") {
     await notifyLine(
@@ -200,6 +226,7 @@ async function processEventInner(event: any, env: Env) {
     if (messageType === "text") {
       await handleTextMessage(event, env);
     } else if (messageType === "image") {
+      logEvent("image_flow", { stage: "received" });
       // 【追加】画像はRender側の解析（最大約28秒）を待つ必要があるため、
       // ここWorkers側で即座にローディングアニメーションを出しておく
       // （Render側の show_loading_sync 呼び出しより一手早く表示できる）。
@@ -213,6 +240,7 @@ async function processEventInner(event: any, env: Env) {
           message_id: event.message.id
         }
       });
+      logEvent("image_flow", { stage: ok ? "render_accepted" : "render_failed" });
       if (!ok) {
         // Renderに届かなければreply_tokenは誰にも使われず、ユーザーは無反応のまま放置される。
         // Workers側から最低限のエラー通知だけは返す。
@@ -231,6 +259,7 @@ async function handleTextMessage(event: any, env: Env) {
   const text = event.message.text.trim();
   const userId = event.source.userId;
   const replyToken = event.replyToken;
+  logEvent("text_flow", { stage: "received", text_length: text.length });
 
   // 4. 固定コマンドのローカル処理
   // 【修正】「リセット」はユーザーの状態(status)をRenderのSheets側で書き換える必要があるため、
@@ -255,6 +284,8 @@ async function handleTextMessage(event: any, env: Env) {
         "リセット処理に失敗しました。恐れ入りますが、もう一度お試しください。",
         env,
       );
+    } else {
+      logEvent("text_flow", { stage: "render_accepted", route: "reset" });
     }
     return;
   }
@@ -263,6 +294,7 @@ async function handleTextMessage(event: any, env: Env) {
   const fixedReply = getFixedCommandReply(text);
   if (fixedReply) {
     await notifyLine(replyToken, userId, fixedReply, env);
+    logEvent("text_flow", { stage: "replied", route: "fixed_command" });
     return;
   }
 
@@ -279,17 +311,33 @@ async function handleTextMessage(event: any, env: Env) {
   let replyText = "";
   let aiSuccess = false;
 
-  try {
-    const aiResult = await classifyWithWorkersAI(text, env);
-    if (aiResult && ALLOWED_INTENTS.has(aiResult.intent)) {
-      intent = aiResult.intent;
-      replyText = aiResult.reply || "";
-      aiSuccess = true;
+  if (looksLikeMealCorrection(text)) {
+    // 「じゃなくて」「本当は」などの明確な訂正表現は、モデルに任せず確定する。
+    // 前回ログがない場合はMain側が安全にmeal_addへ戻す。
+    intent = "meal_correction";
+    aiSuccess = true;
+    logEvent("workers_ai", { outcome: "skipped", reason: "correction_phrase", intent });
+  } else {
+    try {
+      const aiResult = await classifyWithWorkersAI(text, env);
+      if (aiResult && ALLOWED_INTENTS.has(aiResult.intent)) {
+        intent = aiResult.intent;
+        replyText = aiResult.reply || "";
+        aiSuccess = true;
+      }
+    } catch (e) {
+      console.error("Workers AI Error:", formatError(e), e instanceof Error ? e.stack : "");
+      logEvent("workers_ai", { outcome: "error", error: formatError(e) });
+      // AI失敗時はintentを指定せず、Render側の従来Gemini判定へフォールバックする。
     }
-  } catch (e) {
-    console.error("Workers AI Error:", formatError(e), e instanceof Error ? e.stack : "");
-    // AI失敗時はintentを指定せず、Render側の従来Gemini判定へフォールバックする。
   }
+
+  logEvent("text_flow", {
+    stage: "intent_classified",
+    ai_success: aiSuccess,
+    intent: intent || "none",
+    route: intent === "chat" && aiSuccess ? "chat" : "render",
+  });
 
   // 6. Intent 分岐
   if (intent === "chat" && aiSuccess) {
@@ -302,6 +350,7 @@ async function handleTextMessage(event: any, env: Env) {
         `雑談機能は1日の利用回数（${limitResult.limit}回）に達しました。食事の記録なら無制限でご利用いただけます。`,
         env
       );
+      logEvent("daily_limit", { allowed: false, limit: limitResult.limit, count: limitResult.count });
       return;
     }
     // 【追加】「視覚的に見えるようにしてほしい」との要望に対応。
@@ -315,6 +364,7 @@ async function handleTextMessage(event: any, env: Env) {
       truncateForLine(replyText || "こんにちは！", maxReplyLength) + counterNote,
       env,
     );
+    logEvent("daily_limit", { allowed: true, limit: limitResult.limit, count: limitResult.count });
   } else {
     // meal_add / meal_correction / AI失敗時 -> Render へプロキシ。
     // AI失敗時はnullを渡し、Main側のGeminiによる従来判定を有効にする。
@@ -326,6 +376,10 @@ async function handleTextMessage(event: any, env: Env) {
         text: text,
         intent: aiSuccess ? intent : null // 失敗時はRender側でIntentを再判定
       }
+    });
+    logEvent("text_flow", {
+      stage: ok ? "render_accepted" : "render_failed",
+      route: aiSuccess ? intent : "legacy_gemini",
     });
     if (!ok) {
       await notifyLine(
@@ -386,18 +440,19 @@ async function classifyWithWorkersAI(text: string, env: Env): Promise<WorkersAIC
   // 標準版はDeprecatedのため、低遅延の現行モデルを既定値にする。
   const model = env.WORKERS_AI_MODEL || "@cf/meta/llama-3.1-8b-instruct-fast";
   const url = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai/run/${model}`;
+  const startedAt = Date.now();
   
   const prompt = `
 You are a diet assistant. Classify the user input into one of: "chat", "meal_add", "meal_correction".
 - "chat": General conversation, greetings, questions not about specific meal logging.
 - "meal_add": User wants to log a new meal.
-- "meal_correction": User wants to correct the previous meal log.
+- "meal_correction": User says the previous meal log is wrong and wants it replaced or corrected. Look for phrases such as "じゃなくて", "ではなく", "本当は", "訂正", "修正", "さっきの", or "先ほどの".
 If "chat", provide a friendly reply in Japanese in the "reply" field.
 If "meal_add" or "meal_correction", set "reply" to an empty string.
-  Output ONLY one valid JSON object, with exactly these fields:
-  {"intent":"chat","reply":"日本語の返信"}
-  or {"intent":"meal_add","reply":""}
-  or {"intent":"meal_correction","reply":""}
+  Output ONLY one valid JSON object with exactly these fields: "intent" and "reply".
+  For "chat", "reply" must directly answer the exact user input in natural Japanese.
+  Never output placeholder text such as "日本語の返信" or "ユーザーへの返信メッセージ".
+  For "meal_add" or "meal_correction", "reply" must be an empty string.
   Do not output markdown, explanations, or any text outside the JSON object.
 Input: "${text.replace(/"/g, '\\"')}"
 `;
@@ -458,10 +513,22 @@ Input: "${text.replace(/"/g, '\\"')}"
     if (!ALLOWED_INTENTS.has(parsed.intent as Intent)) {
       throw new Error(`許可されていないintent: ${String(parsed.intent)}`);
     }
-    return {
+    const parsedReply = typeof parsed.reply === "string" ? parsed.reply.trim() : "";
+    const placeholderReplaced = parsed.intent === "chat" && isPlaceholderReply(parsedReply);
+    const classification = {
       intent: parsed.intent as Intent,
-      reply: typeof parsed.reply === "string" ? parsed.reply.trim() : "",
+      reply: placeholderReplaced
+        ? "ご連絡ありがとうございます。食事の記録や栄養について、気になることを送ってくださいね。"
+        : parsedReply,
     };
+    logEvent("workers_ai", {
+      outcome: "success",
+      model,
+      intent: classification.intent,
+      placeholder_replaced: placeholderReplaced,
+      elapsed_ms: Date.now() - startedAt,
+    });
+    return classification;
   } catch (e) {
     // 【修正】以前はJSON.parseの失敗理由が分からず、"Workers AI Error"としか
     // ログに残らなかった。実際に届いた本文を一緒に残すことで、次に同じ失敗が
@@ -619,9 +686,17 @@ async function notifyLine(
   message: string,
   env: Env,
 ): Promise<boolean> {
-  if (replyToken && await replyToLine(replyToken, message, env)) return true;
-  if (userId) return pushToLine(userId, message, env);
+  if (replyToken && await replyToLine(replyToken, message, env)) {
+    logEvent("line_delivery", { channel: "reply", outcome: "success" });
+    return true;
+  }
+  if (userId) {
+    const pushed = await pushToLine(userId, message, env);
+    logEvent("line_delivery", { channel: "push", outcome: pushed ? "success" : "failed" });
+    return pushed;
+  }
   console.error("LINE notification skipped: replyToken and userId are both missing");
+  logEvent("line_delivery", { channel: "none", outcome: "failed", reason: "missing_destination" });
   return false;
 }
 
@@ -644,10 +719,14 @@ async function showLoadingAnimation(userId: string, seconds: number, env: Env): 
     if (!res.ok) {
       const bodyText = await res.text().catch(() => "");
       console.error(`showLoadingAnimation: HTTP ${res.status} ${bodyText.slice(0, 200)}`);
+      logEvent("loading", { outcome: "failed", status: res.status });
+    } else {
+      logEvent("loading", { outcome: "started", seconds: roundedSeconds });
     }
   } catch (e) {
     // 【重要】あくまで見た目の補助機能なので、ここで失敗しても本処理は止めない。
     console.error("showLoadingAnimation failed:", e);
+    logEvent("loading", { outcome: "failed", error: formatError(e) });
   }
 }
 
