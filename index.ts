@@ -12,8 +12,59 @@ export interface Env {
   CF_API_TOKEN: string;
   DAILY_LIMIT_KV: KVNamespace; // webhookEventIdの重複排除にのみ使用（Daily LimitはDurable Object化）
   DAILY_LIMIT_DO: DurableObjectNamespace; // 【追加】Daily Limitの原子的カウント用
-  WORKERS_AI_MODEL?: string; // デフォルト: @cf/meta/llama-3.1-8b-instruct
+  WORKERS_AI_MODEL?: string; // デフォルト: @cf/meta/llama-3.1-8b-instruct-fast
   DAILY_CHAT_LIMIT?: string; // デフォルト: "20"
+}
+
+type Intent = "chat" | "meal_add" | "meal_correction";
+
+interface WorkersAIClassification {
+  intent: Intent;
+  reply: string;
+}
+
+const ALLOWED_INTENTS = new Set<Intent>(["chat", "meal_add", "meal_correction"]);
+const JST_TIME_ZONE = "Asia/Tokyo";
+
+function formatError(error: unknown): string {
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
+  return String(error);
+}
+
+function getDailyChatLimit(env: Env): number {
+  const parsed = Number.parseInt(env.DAILY_CHAT_LIMIT || "20", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 20;
+}
+
+function getJstDateKey(date = new Date()): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: JST_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function getNextJstMidnightTimestamp(now = Date.now()): number {
+  // JSTはDSTのないUTC+09:00固定なので、UTC時刻を9時間進めて
+  // 次のUTC日付の00:00へ丸めた後、9時間戻せば次のJST 00:00になる。
+  const jstNow = new Date(now + 9 * 60 * 60 * 1000);
+  const nextJstDateAsUtc = Date.UTC(
+    jstNow.getUTCFullYear(),
+    jstNow.getUTCMonth(),
+    jstNow.getUTCDate() + 1,
+    0,
+    0,
+    0,
+  );
+  return nextJstDateAsUtc - 9 * 60 * 60 * 1000;
+}
+
+function truncateForLine(text: string, maxLength = 5000): string {
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 
 // --- Daily Limit用 Durable Object ---
@@ -30,7 +81,8 @@ export class DailyLimitCounter {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const limit = parseInt(url.searchParams.get("limit") || "20");
+    const parsedLimit = Number.parseInt(url.searchParams.get("limit") || "20", 10);
+    const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : 20;
 
     // Durable Object内は直列実行が保証されるため、この read-modify-write は安全
     let count = (await this.state.storage.get<number>("count")) || 0;
@@ -42,10 +94,11 @@ export class DailyLimitCounter {
     count += 1;
     await this.state.storage.put("count", count);
 
-    // 初回アクセス時のみ、24時間後にアラームをセットしてカウントをリセットする
+    // 初回アクセス時のみ、次の日本時間0時にアラームをセットしてカウントをリセットする。
+    // インスタンス名にもJSTの日付を含めているため、日付境界とリセット境界を一致させる。
     const existingAlarm = await this.state.storage.getAlarm();
     if (existingAlarm === null) {
-      await this.state.storage.setAlarm(Date.now() + 86400 * 1000);
+      await this.state.storage.setAlarm(getNextJstMidnightTimestamp());
     }
 
     return Response.json({ allowed: true, count });
@@ -105,10 +158,13 @@ async function processEvent(event: any, env: Env) {
   try {
     await processEventInner(event, env);
   } catch (e) {
-    console.error("processEvent failed:", e);
-    if (replyToken) {
-      await replyToLine(replyToken, "処理中に問題が起きました。少し時間をおいて、もう一度お試しください。", env).catch(() => {});
-    }
+    console.error("processEvent failed:", formatError(e), e instanceof Error ? e.stack : "");
+    await notifyLine(
+      replyToken,
+      event?.source?.userId,
+      "処理中に問題が起きました。少し時間をおいて、もう一度お試しください。",
+      env,
+    );
   }
 }
 
@@ -125,7 +181,12 @@ async function processEventInner(event: any, env: Env) {
   const userId = event.source.userId;
 
   if (type === "follow") {
-    await replyToLine(replyToken, "友だち追加ありがとうございます！\n食事管理Botです。写真かテキストで食事内容を教えてくださいね。", env);
+    await notifyLine(
+      replyToken,
+      userId,
+      "友だち追加ありがとうございます！\n食事管理Botです。写真かテキストで食事内容を教えてくださいね。",
+      env,
+    );
     return;
   }
 
@@ -155,7 +216,12 @@ async function processEventInner(event: any, env: Env) {
       if (!ok) {
         // Renderに届かなければreply_tokenは誰にも使われず、ユーザーは無反応のまま放置される。
         // Workers側から最低限のエラー通知だけは返す。
-        await replyToLine(replyToken, "写真の処理に失敗しました。恐れ入りますが、もう一度送ってください。", env);
+        await notifyLine(
+          replyToken,
+          userId,
+          "写真の処理に失敗しました。恐れ入りますが、もう一度送ってください。",
+          env,
+        );
       }
     }
   }
@@ -183,7 +249,12 @@ async function handleTextMessage(event: any, env: Env) {
       }
     });
     if (!ok) {
-      await replyToLine(replyToken, "リセット処理に失敗しました。恐れ入りますが、もう一度お試しください。", env);
+      await notifyLine(
+        replyToken,
+        userId,
+        "リセット処理に失敗しました。恐れ入りますが、もう一度お試しください。",
+        env,
+      );
     }
     return;
   }
@@ -191,7 +262,7 @@ async function handleTextMessage(event: any, env: Env) {
   // 「使い方」等、サーバー状態に依存しない完全に静的な返信のみここでローカル処理する
   const fixedReply = getFixedCommandReply(text);
   if (fixedReply) {
-    await replyToLine(replyToken, fixedReply, env);
+    await notifyLine(replyToken, userId, fixedReply, env);
     return;
   }
 
@@ -204,20 +275,20 @@ async function handleTextMessage(event: any, env: Env) {
   await showLoadingAnimation(userId, 30, env);
 
   // 5. Workers AI による Intent 判定
-  let intent = "meal_add"; // デフォルトは安全側（食事記録）
+  let intent: Intent | null = null;
   let replyText = "";
   let aiSuccess = false;
 
   try {
     const aiResult = await classifyWithWorkersAI(text, env);
-    if (aiResult && aiResult.intent) {
+    if (aiResult && ALLOWED_INTENTS.has(aiResult.intent)) {
       intent = aiResult.intent;
       replyText = aiResult.reply || "";
       aiSuccess = true;
     }
   } catch (e) {
-    console.error("Workers AI Error:", e);
-    // AI失敗時はフォールバック（intentはデフォルトのmeal_addのままRenderへ）
+    console.error("Workers AI Error:", formatError(e), e instanceof Error ? e.stack : "");
+    // AI失敗時はintentを指定せず、Render側の従来Gemini判定へフォールバックする。
   }
 
   // 6. Intent 分岐
@@ -225,8 +296,9 @@ async function handleTextMessage(event: any, env: Env) {
     // 雑談判定時: Daily Limit チェック
     const limitResult = await checkAndIncrementDailyLimit(userId, env);
     if (!limitResult.allowed) {
-      await replyToLine(
+      await notifyLine(
         replyToken,
+        userId,
         `雑談機能は1日の利用回数（${limitResult.limit}回）に達しました。食事の記録なら無制限でご利用いただけます。`,
         env
       );
@@ -236,20 +308,32 @@ async function handleTextMessage(event: any, env: Env) {
     // 毎回の雑談返信の末尾に、本日あと何回使えるかを一言添える。
     const remaining = Math.max(limitResult.limit - limitResult.count, 0);
     const counterNote = `\n\n（本日の雑談: 残り${remaining}/${limitResult.limit}回）`;
-    await replyToLine(replyToken, (replyText || "こんにちは！") + counterNote, env);
+    const maxReplyLength = Math.max(1, 5000 - counterNote.length);
+    await notifyLine(
+      replyToken,
+      userId,
+      truncateForLine(replyText || "こんにちは！", maxReplyLength) + counterNote,
+      env,
+    );
   } else {
-    // meal_add / meal_correction / AI失敗時 -> Render へプロキシ
+    // meal_add / meal_correction / AI失敗時 -> Render へプロキシ。
+    // AI失敗時はnullを渡し、Main側のGeminiによる従来判定を有効にする。
     const ok = await proxyToRender(env, {
       endpoint: "/internal/text",
       payload: {
         user_id: userId,
         reply_token: replyToken,
         text: text,
-        intent: intent // Render側でGeminiのIntent判定をスキップするために渡す
+        intent: aiSuccess ? intent : null // 失敗時はRender側でIntentを再判定
       }
     });
     if (!ok) {
-      await replyToLine(replyToken, "処理に失敗しました。恐れ入りますが、もう一度送ってください。", env);
+      await notifyLine(
+        replyToken,
+        userId,
+        "処理に失敗しました。恐れ入りますが、もう一度送ってください。",
+        env,
+      );
     }
   }
 }
@@ -287,15 +371,19 @@ async function isDuplicateEvent(eventId: string, env: Env): Promise<boolean> {
     // 今回のTTLエラーのように、ここで例外を投げるとprocessEvent全体が
     // ctx.waitUntil内で静かに死に、ユーザーには何も届かなくなってしまう。
     // 重複排除に失敗しても「重複ではない」として処理を続行する方が実害が小さい。
-    console.error("isDuplicateEvent failed, treating as non-duplicate:", e);
+    console.error(
+      "isDuplicateEvent failed, treating as non-duplicate:",
+      formatError(e),
+      e instanceof Error ? e.stack : "",
+    );
     return false;
   }
 }
 
-async function classifyWithWorkersAI(text: string, env: Env): Promise<any> {
-  // 【軽量化】判定用途は速度優先でよいため、既定モデルを低遅延版(-fast)に変更。
-  // 通常の8bモデルより応答が速く、失敗率が下がることで legacy(Render側でGeminiに
-  // intentから判定させ直す)経路に落ちる頻度そのものを減らせる。
+async function classifyWithWorkersAI(text: string, env: Env): Promise<WorkersAIClassification> {
+  // JSON Modeは利用可能だが、モデルによるスキーマ遵守が保証されないため、
+  // 現状は通常のJSON指示＋コード側の厳格な検証で扱う。
+  // 標準版はDeprecatedのため、低遅延の現行モデルを既定値にする。
   const model = env.WORKERS_AI_MODEL || "@cf/meta/llama-3.1-8b-instruct-fast";
   const url = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai/run/${model}`;
   
@@ -306,14 +394,14 @@ You are a diet assistant. Classify the user input into one of: "chat", "meal_add
 - "meal_correction": User wants to correct the previous meal log.
 If "chat", provide a friendly reply in Japanese in the "reply" field.
 If "meal_add" or "meal_correction", set "reply" to an empty string.
+  Output ONLY one valid JSON object, with exactly these fields:
+  {"intent":"chat","reply":"日本語の返信"}
+  or {"intent":"meal_add","reply":""}
+  or {"intent":"meal_correction","reply":""}
+  Do not output markdown, explanations, or any text outside the JSON object.
 Input: "${text.replace(/"/g, '\\"')}"
 `;
 
-  // 【修正】以前は自由記述のテキストから正規表現で { ... } を抜き出してJSON.parseしていたが、
-  // モデル（特に-fast版）が指示に従わずコードフェンス（```json ... ```）や前置きの文章を
-  // 付けて返すことがあり、そのままJSON.parseが失敗していた（今回報告されたエラーそのもの）。
-  // Workers AIのJSON Mode（response_format）でスキーマを強制し、モデル側で
-  // 構造化されたJSONしか返させないようにする。これにより解析失敗そのものを減らす。
   // 【修正】以前はタイムアウト(AbortError)もHTTPエラーも「AI API Error」という
   // 中身のない文言でしか分からず、実際に何が起きたのかログから判断できなかった。
   // ステータスコード・レスポンス本文・タイムアウトかどうかを区別して残す。
@@ -327,25 +415,14 @@ Input: "${text.replace(/"/g, '\\"')}"
       },
       body: JSON.stringify({
         prompt,
-        response_format: {
-          type: "json_schema",
-          json_schema: {
-            type: "object",
-            properties: {
-              intent: { type: "string", enum: ["chat", "meal_add", "meal_correction"] },
-              reply: { type: "string" },
-            },
-            required: ["intent", "reply"],
-          },
-        },
       }),
-      signal: AbortSignal.timeout(4000),
+      signal: AbortSignal.timeout(8000),
     });
   } catch (e) {
-    if (e instanceof Error && e.name === "TimeoutError") {
-      throw new Error("Workers AI タイムアウト（4秒以内に応答なし）");
+    if (e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError")) {
+      throw new Error("Workers AI タイムアウト（8秒以内に応答なし）");
     }
-    throw new Error(`Workers AI fetch失敗: ${(e as Error).message}`);
+    throw new Error(`Workers AI fetch失敗: ${formatError(e)}`);
   }
 
   if (!response.ok) {
@@ -353,27 +430,78 @@ Input: "${text.replace(/"/g, '\\"')}"
     throw new Error(`AI API Error: HTTP ${response.status} ${bodyText.slice(0, 300)}`);
   }
   
-  const result = await response.json();
+  let result: any;
+  try {
+    result = await response.json();
+  } catch (e) {
+    throw new Error(`Workers AIレスポンスのJSON解析に失敗: ${formatError(e)}`);
+  }
   // Workers AI のレスポンス構造からテキスト抽出
-  const rawText: string = result.result?.response || "";
+  const rawText = result.result?.response;
+  if (typeof rawText !== "string") {
+    throw new Error("Invalid response from AI（result.responseが文字列ではありません）");
+  }
 
-  // 【修正】JSON Modeを使っていてもモデルがコードフェンスを付けてくることがあるため、
-  // 念のため ```json / ``` を取り除いてから解析する（多層の防御）。
+  // 【防御】モデルがコードフェンス（```json ... ```）を付けて返すことがあるため、
+  // 念のため取り除いてから解析する。
   const cleaned = rawText.replace(/```json|```/g, "").trim();
 
-  // JSON抽出
-  const match = cleaned.match(/\{[\s\S]*\}/);
-  if (!match) {
+  const jsonText = extractFirstJsonObject(cleaned);
+  if (!jsonText) {
     throw new Error(`Invalid JSON from AI（本文が見つからない）: ${rawText.slice(0, 200)}`);
   }
   try {
-    return JSON.parse(match[0]);
+    const parsed = JSON.parse(jsonText);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("JSONオブジェクトではありません");
+    }
+    if (!ALLOWED_INTENTS.has(parsed.intent as Intent)) {
+      throw new Error(`許可されていないintent: ${String(parsed.intent)}`);
+    }
+    return {
+      intent: parsed.intent as Intent,
+      reply: typeof parsed.reply === "string" ? parsed.reply.trim() : "",
+    };
   } catch (e) {
     // 【修正】以前はJSON.parseの失敗理由が分からず、"Workers AI Error"としか
     // ログに残らなかった。実際に届いた本文を一緒に残すことで、次に同じ失敗が
     // 起きたときに原因（コードフェンス、途中で切れた等）をすぐ判断できるようにする。
-    throw new Error(`Invalid JSON from AI（parse失敗: ${(e as Error).message}）: ${match[0].slice(0, 200)}`);
+    throw new Error(`Invalid JSON from AI（parse失敗: ${formatError(e)}）: ${jsonText.slice(0, 200)}`);
   }
+}
+
+function extractFirstJsonObject(text: string): string | null {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+    } else if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return text.slice(start, index + 1);
+    }
+  }
+
+  return null;
 }
 
 async function checkAndIncrementDailyLimit(userId: string, env: Env): Promise<{ allowed: boolean; count: number; limit: number }> {
@@ -381,13 +509,17 @@ async function checkAndIncrementDailyLimit(userId: string, env: Env): Promise<{ 
   // ほぼ同時に2通来ると両方とも同じcurrent値を読み、上限を超えて許可されてしまう）。
   // ユーザーID×日付ごとに1つのDurable Objectインスタンスへ処理を委譲することで、
   // チェックと増加を原子的に行う。
-  const limit = parseInt(env.DAILY_CHAT_LIMIT || "20");
-  const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+  const limit = getDailyChatLimit(env);
+  const today = getJstDateKey(); // YYYY-MM-DD（日本時間）
   const id = env.DAILY_LIMIT_DO.idFromName(`${userId}:${today}`);
   const stub = env.DAILY_LIMIT_DO.get(id);
 
   const response = await stub.fetch(`https://daily-limit/check?limit=${limit}`);
-  const result = await response.json<{ allowed: boolean; count: number }>();
+  if (!response.ok) {
+    const bodyText = await response.text().catch(() => "");
+    throw new Error(`Daily Limit DO Error: HTTP ${response.status} ${bodyText.slice(0, 200)}`);
+  }
+  const result = await response.json() as { allowed: boolean; count: number };
   // 【追加】呼び出し側で「本日あと何回使えるか」を表示できるよう、countとlimitも返す。
   return { allowed: result.allowed, count: result.count, limit };
 }
@@ -424,23 +556,73 @@ async function proxyToRender(env: Env, data: { endpoint: string, payload: any })
     }
     return true;
   } catch (e) {
-    console.error(`proxyToRender: request to ${data.endpoint} failed:`, e);
+    console.error(`proxyToRender: request to ${data.endpoint} failed: ${formatError(e)}`);
     return false;
   }
 }
 
-async function replyToLine(replyToken: string, message: string, env: Env) {
-  await fetch("https://api.line.me/v2/bot/message/reply", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}`
-    },
-    body: JSON.stringify({
-      replyToken,
-      messages: [{ type: "text", text: message }]
-    })
-  });
+async function replyToLine(replyToken: string, message: string, env: Env): Promise<boolean> {
+  try {
+    const response = await fetch("https://api.line.me/v2/bot/message/reply", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}`
+      },
+      body: JSON.stringify({
+        replyToken,
+        messages: [{ type: "text", text: truncateForLine(message) }]
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok) {
+      const bodyText = await response.text().catch(() => "");
+      console.error(`LINE reply failed: HTTP ${response.status} ${bodyText.slice(0, 300)}`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error(`LINE reply request failed: ${formatError(e)}`);
+    return false;
+  }
+}
+
+async function pushToLine(userId: string, message: string, env: Env): Promise<boolean> {
+  try {
+    const response = await fetch("https://api.line.me/v2/bot/message/push", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}`
+      },
+      body: JSON.stringify({
+        to: userId,
+        messages: [{ type: "text", text: truncateForLine(message) }]
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok) {
+      const bodyText = await response.text().catch(() => "");
+      console.error(`LINE push failed: HTTP ${response.status} ${bodyText.slice(0, 300)}`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error(`LINE push request failed: ${formatError(e)}`);
+    return false;
+  }
+}
+
+async function notifyLine(
+  replyToken: string | undefined,
+  userId: string | undefined,
+  message: string,
+  env: Env,
+): Promise<boolean> {
+  if (replyToken && await replyToLine(replyToken, message, env)) return true;
+  if (userId) return pushToLine(userId, message, env);
+  console.error("LINE notification skipped: replyToken and userId are both missing");
+  return false;
 }
 
 async function showLoadingAnimation(userId: string, seconds: number, env: Env): Promise<void> {

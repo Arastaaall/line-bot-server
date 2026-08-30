@@ -377,7 +377,11 @@ def save_error_log(user_id: str | None, function_name: str, error_message: str) 
         import traceback
         # エラーメッセージにスタックトレースが含まれていない場合は追加
         if "Traceback" not in error_message:
-            error_message = f"{error_message}\n{traceback.format_exc()}"
+            current_trace = traceback.format_exc()
+            # save_error_logは別スレッドから呼ばれることがあり、その場合は
+            # ここにアクティブな例外がなく「NoneType: None」だけになる。
+            if current_trace.strip() != "NoneType: None":
+                error_message = f"{error_message}\n{current_trace}"
 
         _append_by_header(
             "error_logs",

@@ -86,16 +86,18 @@ async def get_user_lock(user_id: str):
 # --- リクエストモデル ---
 class InternalTextRequest(BaseModel):
     user_id: str
-    reply_token: str
+    reply_token: str | None = None
     text: str
     intent: str | None = None  # Workers AIからの判定結果
 
 class InternalImageRequest(BaseModel):
     user_id: str
-    reply_token: str
+    reply_token: str | None = None
     message_id: str
 
-# --- エンドポイント ---
+# --- バックグラウンドタスクとエンドポイント ---
+
+_background_tasks: set[asyncio.Task] = set()
 
 def _log_background_task_error(task: asyncio.Task):
     """バックグラウンドタスク内で捕捉されずに漏れた例外だけを拾ってログに残す
@@ -103,9 +105,60 @@ def _log_background_task_error(task: asyncio.Task):
     """
     if task.cancelled():
         return
-    exc = task.exception()
+    try:
+        exc = task.exception()
+    except Exception as callback_exc:
+        logger.error("バックグラウンドタスクの結果取得に失敗しました: %s", callback_exc)
+        return
     if exc:
-        logger.error(f"バックグラウンドタスクが失敗しました: {exc}\n{traceback.format_exc()}")
+        logger.error(
+            "バックグラウンドタスクが失敗しました: %s",
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
+async def _reply_or_push(user_id: str, reply_token: str | None, message: str) -> bool:
+    """Reply tokenを優先し、失敗または欠落時はPushへ切り替える。"""
+    if reply_token:
+        try:
+            await asyncio.to_thread(send_reply_sync, reply_token, message)
+            return True
+        except Exception as exc:
+            logger.warning("LINE Replyに失敗したためPushへ切り替えます: %s", exc)
+
+    try:
+        await asyncio.to_thread(send_push_sync, user_id, message)
+        return True
+    except Exception as exc:
+        logger.error("LINE Reply/Pushの両方に失敗しました: %s", exc, exc_info=True)
+        return False
+
+async def _handle_background_failure(
+    user_id: str,
+    reply_token: str | None,
+    function_name: str,
+    exc: Exception,
+) -> None:
+    """即時200を返した後の処理で漏れた例外を記録し、ユーザーへ通知する。"""
+    error_detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    logger.error("%sでバックグラウンド処理に失敗しました: %s", function_name, exc, exc_info=True)
+    try:
+        await asyncio.to_thread(sheets.save_error_log, user_id, function_name, error_detail)
+    except Exception as log_exc:
+        logger.error("エラーログの保存にも失敗しました: %s", log_exc, exc_info=True)
+    await _reply_or_push(
+        user_id,
+        reply_token,
+        "処理中に問題が起きました。少し時間をおいて、もう一度お試しください。",
+    )
+
+def _track_background_task(coro) -> asyncio.Task:
+    """タスクを保持し、GCや未処理例外で静かに消えないようにする。"""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    task.add_done_callback(_log_background_task_error)
+    return task
 
 @app.post("/internal/text", dependencies=[Depends(verify_internal_secret)])
 async def internal_text_webhook(req: InternalTextRequest):
@@ -121,24 +174,28 @@ async def internal_text_webhook(req: InternalTextRequest):
     そのため asyncio.create_task で処理を切り離し、即座に200を返す。
     """
     async def _run():
-        user_lock = await get_user_lock(req.user_id)
-        async with user_lock:
-            await process_internal_text_event(req.user_id, req.reply_token, req.text, req.intent)
+        try:
+            user_lock = await get_user_lock(req.user_id)
+            async with user_lock:
+                await process_internal_text_event(req.user_id, req.reply_token, req.text, req.intent)
+        except Exception as exc:
+            await _handle_background_failure(req.user_id, req.reply_token, "internal_text_webhook", exc)
 
-    task = asyncio.create_task(_run())
-    task.add_done_callback(_log_background_task_error)
+    _track_background_task(_run())
     return {"status": "accepted"}
 
 @app.post("/internal/image", dependencies=[Depends(verify_internal_secret)])
 async def internal_image_webhook(req: InternalImageRequest):
     """Workers経由の画像処理。理由は internal_text_webhook のコメントを参照。"""
     async def _run():
-        user_lock = await get_user_lock(req.user_id)
-        async with user_lock:
-            await process_internal_image_event(req.user_id, req.reply_token, req.message_id)
+        try:
+            user_lock = await get_user_lock(req.user_id)
+            async with user_lock:
+                await process_internal_image_event(req.user_id, req.reply_token, req.message_id)
+        except Exception as exc:
+            await _handle_background_failure(req.user_id, req.reply_token, "internal_image_webhook", exc)
 
-    task = asyncio.create_task(_run())
-    task.add_done_callback(_log_background_task_error)
+    _track_background_task(_run())
     return {"status": "accepted"}
 
 # --- バリデーション関数 ---
@@ -201,7 +258,14 @@ def check_user_paid_status(user: dict) -> bool:
 
 # --- 処理ロジックの拡張 ---
 
-async def process_internal_text_event(user_id: str, reply_token: str, text: str, intent_from_workers: str | None):
+_WORKER_MEAL_INTENTS = {"meal_add", "meal_correction"}
+
+async def process_internal_text_event(
+    user_id: str,
+    reply_token: str | None,
+    text: str,
+    intent_from_workers: str | None,
+):
     """WorkersからのIntent指定に対応したテキスト処理。"""
     user = await asyncio.to_thread(sheets.get_user, user_id)
     if not user or user.get("status") not in ("completed", "awaiting_correction"):
@@ -216,11 +280,14 @@ async def process_internal_text_event(user_id: str, reply_token: str, text: str,
     # 実際にはユーザー状態が一切リセットされていなかった。
     fixed_reply = await asyncio.to_thread(_handle_fixed_text_command, user_id, user, text)
     if fixed_reply is not None:
-        if reply_token:
-            await asyncio.to_thread(send_reply_sync, reply_token, fixed_reply)
-        else:
-            await asyncio.to_thread(send_push_sync, user_id, fixed_reply)
+        await _reply_or_push(user_id, reply_token, fixed_reply)
         return
+
+    # 内部APIでは、Workersから食事系intentだけを受け付ける。
+    # chatや未知の値はここでGeminiの従来判定へ戻し、未知の値を食事追加として扱わない。
+    if intent_from_workers is not None and intent_from_workers not in _WORKER_MEAL_INTENTS:
+        logger.warning("未知または未対応のWorkers intentを再判定へ戻します: %r", intent_from_workers)
+        intent_from_workers = None
 
     # Intent が指定されていない（Workers AI失敗時など）は、GeminiにIntent判定から依頼する
     if not intent_from_workers:
@@ -254,12 +321,11 @@ async def process_internal_text_event(user_id: str, reply_token: str, text: str,
         await asyncio.to_thread(_deliver_text_analysis_result, reply_token, user_id, user, result, is_push=False)
     except asyncio.TimeoutError:
         logger.warning(f"数値抽出がタイムアウト(internal): user_id={user_id}, text={text[:50]}")
-        if reply_token:
-            await asyncio.to_thread(
-                send_reply_sync,
-                reply_token,
-                "⏳ ただいま確認しています。終わり次第、こちらへお知らせします。",
-            )
+        await _reply_or_push(
+            user_id,
+            reply_token,
+            "⏳ ただいま確認しています。終わり次第、こちらへお知らせします。",
+        )
         try:
             result = await task
             await asyncio.to_thread(_deliver_text_analysis_result, None, user_id, user, result, is_push=True)
@@ -283,20 +349,13 @@ async def process_internal_text_event(user_id: str, reply_token: str, text: str,
             await asyncio.to_thread(sheets.save_error_log, user_id, "process_internal_text_event", error_detail)
         except Exception:
             pass
-        if reply_token:
-            await asyncio.to_thread(
-                send_reply_sync,
-                reply_token,
-                "処理中に問題が起きました。少し時間をおいて、もう一度送ってください。",
-            )
-        else:
-            await asyncio.to_thread(
-                send_push_sync,
-                user_id,
-                "処理中に問題が起きました。少し時間をおいて、もう一度送ってください。",
-            )
+        await _reply_or_push(
+            user_id,
+            reply_token,
+            "処理中に問題が起きました。少し時間をおいて、もう一度送ってください。",
+        )
 
-async def handle_setup_or_common(user_id: str, reply_token: str, text: str, user=None):
+async def handle_setup_or_common(user_id: str, reply_token: str | None, text: str, user=None):
     """【実装追加】Workers経由でテキストが来たが、ユーザーが初期設定中／未登録だった場合の処理。
     既存の /callback 経路（process_text_event冒頭）と同じ initial_setup_message を使う。
     以前はこの関数自体が未定義で、該当パスに来た瞬間に NameError になっていた。
@@ -307,13 +366,10 @@ async def handle_setup_or_common(user_id: str, reply_token: str, text: str, user
     message = await asyncio.to_thread(
         initial_setup_message, user_id, text, user if user is not None else _NOT_PROVIDED
     )
-    if reply_token:
-        await asyncio.to_thread(send_reply_sync, reply_token, message)
-    else:
-        # Workers側でreply_tokenを渡し忘れた等の異常系はPushにフォールバック
-        await asyncio.to_thread(send_push_sync, user_id, message)
+    # Workers側でreply_tokenを渡し忘れた場合もPushへフォールバック。
+    await _reply_or_push(user_id, reply_token, message)
 
-async def process_text_meal_or_chat_legacy(reply_token: str, user_id: str, user: dict, text: str):
+async def process_text_meal_or_chat_legacy(reply_token: str | None, user_id: str, user: dict, text: str):
     """【実装追加】Workers AIがintent判定に失敗した（intentが渡ってこない）場合のフォールバック経路。
     既存の process_text_meal_or_chat と同じロジックだが、LINEのeventオブジェクトを
     受け取らず reply_token を直接受け取る点だけが異なる（Workers経由にはLINE event型が無いため）。
@@ -330,12 +386,11 @@ async def process_text_meal_or_chat_legacy(reply_token: str, user_id: str, user:
         await asyncio.to_thread(_deliver_text_analysis_result, reply_token, user_id, user, result, is_push=False)
     except asyncio.TimeoutError:
         logger.warning(f"テキスト解析がタイムアウト(internal): user_id={user_id}, text={text[:50]}")
-        if reply_token:
-            await asyncio.to_thread(
-                send_reply_sync,
-                reply_token,
-                "⏳ ただいま確認しています。終わり次第、こちらへお知らせします。",
-            )
+        await _reply_or_push(
+            user_id,
+            reply_token,
+            "⏳ ただいま確認しています。終わり次第、こちらへお知らせします。",
+        )
         try:
             result = await task
             await asyncio.to_thread(_deliver_text_analysis_result, None, user_id, user, result, is_push=True)
@@ -359,20 +414,13 @@ async def process_text_meal_or_chat_legacy(reply_token: str, user_id: str, user:
             await asyncio.to_thread(sheets.save_error_log, user_id, "process_text_meal_or_chat_legacy", error_detail)
         except Exception:
             pass
-        if reply_token:
-            await asyncio.to_thread(
-                send_reply_sync,
-                reply_token,
-                "処理中に問題が起きました。少し時間をおいて、もう一度送ってください。",
-            )
-        else:
-            await asyncio.to_thread(
-                send_push_sync,
-                user_id,
-                "処理中に問題が起きました。少し時間をおいて、もう一度送ってください。",
-            )
+        await _reply_or_push(
+            user_id,
+            reply_token,
+            "処理中に問題が起きました。少し時間をおいて、もう一度送ってください。",
+        )
 
-async def process_internal_image_event(user_id: str, reply_token: str, message_id: str):
+async def process_internal_image_event(user_id: str, reply_token: str | None, message_id: str):
     """【実装追加】Workers経由の画像処理。既存の process_image_event と同じロジックだが、
     LINEのeventオブジェクトを受け取らず user_id/reply_token/message_id を直接受け取る。
     以前はこの関数自体が未定義で、/internal/image を叩くたびに NameError になっていた。
@@ -380,14 +428,15 @@ async def process_internal_image_event(user_id: str, reply_token: str, message_i
     user = await asyncio.to_thread(sheets.get_user, user_id)
 
     if user is None or user.get("status") not in ("completed", "awaiting_correction"):
-        await asyncio.to_thread(
-            send_reply_sync,
+        await _reply_or_push(
+            user_id,
             reply_token,
             "初期設定がまだ完了していません。「リセット」と送って設定を始めてください。",
         )
         return
 
-    await asyncio.to_thread(show_loading_sync, user_id, 15)
+    # Workers側が30秒のローディング表示を開始済み。
+    # ここで15秒に上書きすると画像解析中に表示が先に消えるため、再発行しない。
 
     async def get_and_analyze():
         image_bytes, mime_type = await asyncio.to_thread(fetch_line_image, message_id)
@@ -397,11 +446,17 @@ async def process_internal_image_event(user_id: str, reply_token: str, message_i
     try:
         result = await asyncio.wait_for(asyncio.shield(task), timeout=IMAGE_TOTAL_TIMEOUT)
         message = await asyncio.to_thread(save_analysis_and_build_message, user_id, user, result)
-        await asyncio.to_thread(send_reply_with_quick_replies_sync, reply_token, message)
+        if reply_token:
+            try:
+                await asyncio.to_thread(send_reply_with_quick_replies_sync, reply_token, message)
+            except Exception:
+                await asyncio.to_thread(send_push_sync, user_id, message)
+        else:
+            await asyncio.to_thread(send_push_sync, user_id, message)
 
     except asyncio.TimeoutError:
-        await asyncio.to_thread(
-            send_reply_sync,
+        await _reply_or_push(
+            user_id,
             reply_token,
             "⏳ ただいま写真を解析しています。終わり次第、こちらへお知らせします。",
         )
@@ -412,12 +467,13 @@ async def process_internal_image_event(user_id: str, reply_token: str, message_i
             await asyncio.to_thread(sheets.save_push_log, user_id, "画像解析の結果通知(internal)")
         except Exception as exc:
             try:
-                await asyncio.to_thread(sheets.save_error_log, user_id, "process_internal_image_event", str(exc))
+                error_detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                await asyncio.to_thread(sheets.save_error_log, user_id, "process_internal_image_event", error_detail)
             except Exception:
                 pass
-            await asyncio.to_thread(
-                send_push_sync,
+            await _reply_or_push(
                 user_id,
+                None,
                 "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
             )
 
@@ -428,18 +484,11 @@ async def process_internal_image_event(user_id: str, reply_token: str, message_i
         except Exception:
             pass
 
-        try:
-            await asyncio.to_thread(
-                send_reply_sync,
-                reply_token,
-                "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。"
-            )
-        except Exception:
-            await asyncio.to_thread(
-                send_push_sync,
-                user_id,
-                "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
-            )
+        await _reply_or_push(
+            user_id,
+            reply_token,
+            "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
+        )
 
 def analyze_text_for_extraction(text: str, user: dict, last_meal_context: dict | None, force_intent: str) -> dict:
     """Intent判定をスキップし、数値抽出に特化したGemini呼び出し。"""
@@ -578,9 +627,10 @@ def show_loading_sync(user_id, seconds=5):
     try:
         with urllib.request.urlopen(request, timeout=10):
             pass
-    except (urllib.error.HTTPError, urllib.error.URLError):
-        # ローディング表示の失敗は、本体の返信を止めない。
-        pass
+    except Exception as exc:
+        # ローディング表示は補助機能なので、HTTPエラー・通信エラー・
+        # ソケットのTimeoutErrorを含め、本体の返信を止めない。
+        logger.warning("LINEローディング表示に失敗しました: %s", exc)
 
 KCAL_PER_KG = 7200  # 体重1kgの増減に必要なカロリー差の目安値
 LOSS_MAX_DAILY_DEFICIT = 750  # 減量時、1日あたりに削ってよいカロリーの安全上限
@@ -862,8 +912,11 @@ def build_today_reflection(user_id, user):
 
 async def process_follow_event(event):
     user_id = event.source.user_id
-    message = await asyncio.to_thread(initial_setup_message, user_id, "リセット")
-    await asyncio.to_thread(send_reply_sync, event.reply_token, message)
+    try:
+        message = await asyncio.to_thread(initial_setup_message, user_id, "リセット")
+        await _reply_or_push(user_id, event.reply_token, message)
+    except Exception as exc:
+        await _handle_background_failure(user_id, event.reply_token, "process_follow_event", exc)
 
 def _handle_fixed_text_command(user_id, user, text):
     """設定完了後のユーザーに対して、リセット・使い方などの固定コマンドを処理する。
@@ -1054,7 +1107,11 @@ def _deliver_text_analysis_result(reply_token, user_id, user, result, *, is_push
             if is_push:
                 send_push_sync(user_id, message)
             elif reply_token:
-                send_reply_sync(reply_token, message)
+                try:
+                    send_reply_sync(reply_token, message)
+                except Exception:
+                    # Reply tokenの期限切れ・LINE API障害時も、返信内容を失わない。
+                    send_push_sync(user_id, message)
             else:
                 # reply_tokenもis_pushもない場合はPushで送信
                 send_push_sync(user_id, message)
@@ -1070,7 +1127,11 @@ def _deliver_text_analysis_result(reply_token, user_id, user, result, *, is_push
         if is_push:
             send_push_sync(user_id, message)
         elif reply_token:
-            send_reply_with_quick_replies_sync(reply_token, message)
+            try:
+                send_reply_with_quick_replies_sync(reply_token, message)
+            except Exception:
+                # Quick Reply付きReplyに失敗しても、本文だけはPushで届ける。
+                send_push_sync(user_id, message)
         else:
             # reply_tokenが切れている場合はPushで送信
             send_push_sync(user_id, message)
@@ -1174,8 +1235,8 @@ async def process_text_meal_or_chat(event, user_id, user, text):
         await asyncio.to_thread(_deliver_text_analysis_result, reply_token, user_id, user, result, is_push=False)
     except asyncio.TimeoutError:
         logger.warning(f"テキスト解析がタイムアウト: user_id={user_id}, text={text[:50]}")
-        await asyncio.to_thread(
-            send_reply_sync,
+        await _reply_or_push(
+            user_id,
             reply_token,
             "⏳ ただいま確認しています。終わり次第、こちらへお知らせします。",
         )
@@ -1202,8 +1263,8 @@ async def process_text_meal_or_chat(event, user_id, user, text):
             await asyncio.to_thread(sheets.save_error_log, user_id, "process_text_event", error_detail)
         except Exception:
             pass
-        await asyncio.to_thread(
-            send_reply_sync,
+        await _reply_or_push(
+            user_id,
             reply_token,
             "処理中に問題が起きました。少し時間をおいて、もう一度送ってください。",
         )
@@ -1220,7 +1281,7 @@ async def process_text_event(event):
         # 初期設定中、またはユーザー未登録の場合は、従来の処理を継続
         if current_user is None or current_user.get("status") not in ("completed", "awaiting_correction"):
             message = await asyncio.to_thread(initial_setup_message, user_id, text, current_user)
-            await asyncio.to_thread(send_reply_sync, event.reply_token, message)
+            await _reply_or_push(user_id, event.reply_token, message)
             return
         
         status = current_user.get("status")
@@ -1233,7 +1294,7 @@ async def process_text_event(event):
         # Geminiを介さずここで即答する（速度・コスト・誤判定防止のため）
         fixed_reply = await asyncio.to_thread(_handle_fixed_text_command, user_id, current_user, text)
         if fixed_reply is not None:
-            await asyncio.to_thread(send_reply_sync, event.reply_token, fixed_reply)
+            await _reply_or_push(user_id, event.reply_token, fixed_reply)
             return
         
         # 【修正】v4.1仕様で廃止された「3秒一律拒否」ルールは削除。
@@ -1248,7 +1309,7 @@ async def process_text_event(event):
         except Exception:
             pass
         message = "処理中に問題が起きました。少し時間をおいて、もう一度送ってください。"
-        await asyncio.to_thread(send_reply_sync, event.reply_token, message)
+        await _reply_or_push(user_id, event.reply_token, message)
 
 MEDICAL_GUARDRAIL = (
     "\n\n【重要な制約】\n"
@@ -1319,10 +1380,10 @@ def _gemini_models_to_try():
     """試すモデルの候補リストを作る。
     GEMINI_MODEL が本命（環境変数未設定時のデフォルトは無料枠のある gemini-3.1-flash-lite）。
     GEMINI_FALLBACK_MODELS（カンマ区切り、例:
-    "gemini-3-flash,gemini-3.5-flash-lite"）を設定しておくと、
+    "gemini-3.5-flash,gemini-3.5-flash-lite"）を設定しておくと、
     本命モデルが使えなかったときだけ順番に次を試す。
     未設定の場合も、Groqへ行く前にGemini内で吸収できるよう既定のフォールバック列を使う
-    （gemini-3-flash, gemini-3.5-flash-lite）。
+    （gemini-3.5-flash, gemini-3.5-flash-lite）。
     環境変数にありがちな引用符・前後の空白・改行は、ここで取り除いておく
     （Renderの入力欄に "gemini-2.5-flash" のように引用符ごと貼り付けてしまうと、
     そのままではAPIが404を返すため）。
@@ -1335,7 +1396,7 @@ def _gemini_models_to_try():
     # GEMINI_FALLBACK_MODELS未設定でも、無料枠内の複数モデルへ自動で回せるよう
     # デフォルトのフォールバック列も用意しておく（未設定時のみ使われる）。
     primary = _clean(os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite"))
-    default_fallbacks = "gemini-3-flash,gemini-3.5-flash-lite"
+    default_fallbacks = "gemini-3.5-flash,gemini-3.5-flash-lite"
     fallbacks = [
         _clean(m)
         for m in os.environ.get("GEMINI_FALLBACK_MODELS", default_fallbacks).split(",")
@@ -1692,18 +1753,27 @@ async def handle_callback(request: Request):
         elif isinstance(event, MessageEvent) and isinstance(event.message, TextMessageContent):
             await process_text_event(event)
         elif isinstance(event, MessageEvent) and isinstance(event.message, ImageMessageContent):
-            asyncio.create_task(process_image_event(event))
+            _track_background_task(process_image_event(event))
     
     return "OK"
 
 async def process_image_event(event):
+    """非常用の直接Webhook経路。開始前の例外もユーザーへ通知する。"""
+    user_id = event.source.user_id
+    reply_token = event.reply_token
+    try:
+        await _process_image_event_inner(event)
+    except Exception as exc:
+        await _handle_background_failure(user_id, reply_token, "process_image_event", exc)
+
+async def _process_image_event_inner(event):
     user_id = event.source.user_id
     reply_token = event.reply_token
     user = await asyncio.to_thread(sheets.get_user, user_id)
     
     if user is None or user.get("status") not in ("completed", "awaiting_correction"):
-        await asyncio.to_thread(
-            send_reply_sync,
+        await _reply_or_push(
+            user_id,
             reply_token,
             "初期設定がまだ完了していません。「リセット」と送って設定を始めてください。",
         )
@@ -1720,11 +1790,17 @@ async def process_image_event(event):
         
         result = await asyncio.wait_for(asyncio.shield(task), timeout=IMAGE_TOTAL_TIMEOUT)
         message = await asyncio.to_thread(save_analysis_and_build_message, user_id, user, result)
-        await asyncio.to_thread(send_reply_with_quick_replies_sync, reply_token, message)
+        if reply_token:
+            try:
+                await asyncio.to_thread(send_reply_with_quick_replies_sync, reply_token, message)
+            except Exception:
+                await asyncio.to_thread(send_push_sync, user_id, message)
+        else:
+            await asyncio.to_thread(send_push_sync, user_id, message)
         
     except asyncio.TimeoutError:
-        await asyncio.to_thread(
-            send_reply_sync,
+        await _reply_or_push(
+            user_id,
             reply_token,
             "⏳ ただいま写真を解析しています。終わり次第、こちらへお知らせします。",
         )
@@ -1735,12 +1811,13 @@ async def process_image_event(event):
             await asyncio.to_thread(sheets.save_push_log, user_id, "画像解析の結果通知")
         except Exception as exc:
             try:
-                await asyncio.to_thread(sheets.save_error_log, user_id, "process_image_event", str(exc))
+                error_detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                await asyncio.to_thread(sheets.save_error_log, user_id, "process_image_event", error_detail)
             except Exception:
                 pass
-            await asyncio.to_thread(
-                send_push_sync,
+            await _reply_or_push(
                 user_id,
+                None,
                 "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
             )
             
@@ -1752,16 +1829,8 @@ async def process_image_event(event):
         except Exception:
             pass
             
-        # reply_tokenが無効な場合を考慮してPushにもフォールバック
-        try:
-            await asyncio.to_thread(
-                send_reply_sync, 
-                reply_token, 
-                "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。"
-            )
-        except Exception:
-            await asyncio.to_thread(
-                send_push_sync,
-                user_id,
-                "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
-            )
+        await _reply_or_push(
+            user_id,
+            reply_token,
+            "写真の解析に失敗しました。恐れ入りますが、もう一度写真を送ってください。",
+        )
