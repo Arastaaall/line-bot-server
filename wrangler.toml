@@ -7,17 +7,25 @@ compatibility_date = "2024-01-01"
 binding = "DAILY_LIMIT_KV"
 id = "449d99f632604fadadf3e638e4cab98f"
 
-# Durable Objects のバインディング
+# Durable Objects bindings
 [[durable_objects.bindings]]
 name = "DAILY_LIMIT_DO"
-class_name = "DailyLimitCounter"
+class_name = "DailyLimitCounterV2"
 
-# マイグレーション設定
+[[durable_objects.bindings]]
+name = "CHAT_CONTEXT_DO"
+class_name = "ChatContext"
+
+# Migrations
 [[migrations]]
 tag = "v1"
 new_classes = ["DailyLimitCounter"]
 
-# Observability 設定（修正版）
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["DailyLimitCounterV2", "ChatContext"]
+
+# Observability
 [observability]
 enabled = true
 

@@ -1096,7 +1096,12 @@ def _log_fallback_notice_if_any(user_id, result):
         pass
 
 def _deliver_text_analysis_result(reply_token, user_id, user, result, *, is_push):
-    """Geminiのテキスト解析結果（食事 or 雑談）を保存し、Reply/Pushいずれかで届ける。"""
+    """Geminiのテキスト解析結果（食事 or 雑談）を保存し、適切な経路で届ける。
+
+    雑談は本来機能ではないため、Reply tokenでの即時返信だけを許可する。
+    Reply失敗時にPushで雑談を後追い送信すると会話が長引くため、雑談だけは破棄して記録する。
+    食事記録は従来どおりReply失敗時にPushへフォールバックする。
+    """
     try:
         _log_fallback_notice_if_any(user_id, result)
         intent = result["type"]
@@ -1105,18 +1110,16 @@ def _deliver_text_analysis_result(reply_token, user_id, user, result, *, is_push
         if intent == "chat":
             message = result["reply"]
             if is_push:
-                send_push_sync(user_id, message)
-            elif reply_token:
-                try:
-                    send_reply_sync(reply_token, message)
-                except Exception:
-                    # Reply tokenの期限切れ・LINE API障害時も、返信内容を失わない。
-                    send_push_sync(user_id, message)
-            else:
-                # reply_tokenもis_pushもない場合はPushで送信
-                send_push_sync(user_id, message)
-                sheets.save_error_log(user_id, "_deliver_text_analysis_result", 
-                                    "reply_tokenがなく、is_push=Falseでした。Pushにフォールバック")
+                logger.warning("雑談返信はReply専用のため、Push送信を行わず終了します: user_id=%s", user_id)
+                return
+            if not reply_token:
+                logger.warning("雑談返信のreply_tokenがないため、Push送信を行わず終了します: user_id=%s", user_id)
+                return
+            try:
+                send_reply_sync(reply_token, message)
+            except Exception as exc:
+                # 雑談はReply失敗時にPushへ切り替えず、本来の食事管理機能へ戻す。
+                logger.warning("雑談のReplyに失敗したためPush送信を行いません: %s", exc, exc_info=True)
             return
             
         if intent == "meal_correction":
