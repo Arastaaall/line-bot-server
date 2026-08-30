@@ -36,7 +36,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-CHAT_GUIDANCE = "食べたものがあれば、気軽に教えてくださいね。写真でも大丈夫です。"
+CHAT_GUIDANCE = "食べたものがあれば、気軽に教えてくださいね😊 写真でも大丈夫ですよ。"
+
+# 【追加】「使い方」「カロリー確認」「振り返り」は完全一致の文言だけでなく、
+# 「トータルカロリーの確認」のような言い回しでも確実に固定コマンドとして
+# 処理できるようにする。ここで拾えない場合、Gemini/Workers AIの雑談判定に
+# 流れて「雑談」として扱われてしまい、実データではない返答になってしまう。
+_USAGE_KEYWORD_PATTERN = re.compile(r"使い方|つかいかた|ヘルプ|ガイド")
+_REFLECTION_KEYWORD_PATTERN = re.compile(r"振り返")
+_SUMMARY_SUBJECT_PATTERN = re.compile(r"(トータル|総合|合計|カロリー)")
+_SUMMARY_ACTION_PATTERN = re.compile(r"(確認|チェック|教えて|知りたい|見せて|どのくらい|どれくらい|状況|把握)")
 
 # 【修正】app はここで先に生成する。
 # 以前は下の方（旧218行目付近）で定義されており、それより前にある
@@ -755,13 +764,16 @@ def handle_common_keywords(user_id, user, status, text):
     毎回Geminiに投げて時間とコストをかけずに済む。該当しない場合はNoneを返す。
     """
     text = text.strip()
-    if text in ("使い方", "つかいかた", "ヘルプ", "ガイド"):
+    if text in ("使い方", "つかいかた", "ヘルプ", "ガイド") or _USAGE_KEYWORD_PATTERN.search(text):
         return "食事写真を送ると、料理とカロリーを記録します。判定の直後なら、料理名や量を送って修正できます。設定をやり直すときは「リセット」と送ってください。"
-    if text in ("総", "総合", "トータル", "カロリー", "本日", "今日", "合計", "確認"):
+    is_summary_request = text in ("総", "総合", "トータル", "カロリー", "本日", "今日", "合計", "確認") or (
+        _SUMMARY_SUBJECT_PATTERN.search(text) and _SUMMARY_ACTION_PATTERN.search(text)
+    )
+    if is_summary_request:
         if status == "awaiting_correction":
             sheets.save_user(user_id, "completed")
         return build_today_summary(user)
-    if text in ("振り返る", "振り返り"):
+    if text in ("振り返る", "振り返り") or _REFLECTION_KEYWORD_PATTERN.search(text):
         if status == "awaiting_correction":
             sheets.save_user(user_id, "completed")
         return build_today_reflection(user_id, user)
@@ -1006,10 +1018,15 @@ def analyze_text_input(text: str, user: dict, last_meal_context: dict | None) ->
         "微量栄養素は推定値で構いません（数値のみ、単位なし）。\n\n"
         "食事に関係ない場合：\n"
         '{ "intent": "chat", "reply": "ユーザーへの返信メッセージ" }\n'
-        "chatの返信は、相手の気持ちを短く受け止める温かく自然な日本語にしてください。"
+        "chatの返信は、次の考え方で1〜2文の温かく自然な日本語にしてください。\n"
+        "1. まずユーザーの気持ちや話題に短く共感・反応する。\n"
+        "2. 話題に自然につながる一言を添えてもよい（関係のない情報は割り込ませない）。\n"
+        "3. 食事・飲み物・体調など記録に自然につながる話題のときだけ、押しつけがましくならない範囲で"
+        "「写真を送ってくれれば記録できますよ」のように軽く思い出させる。関係が薄い話題では毎回付けなくてよい。\n"
+        "絵文字は😊🍵📷️☺️💪🥶☔️のような温かい印象のものを、多くても1〜2個までなら使ってよい（無理に使わなくてもよい）。\n"
         "冷たい事務的な表現、「気分を害したくない」などの自己防衛的な表現、入力のオウム返しは避けてください。"
-        "会話を長引かせる質問はせず、質問する場合も食事の記録や栄養相談に直結するものを1つまでにしてください。"
-        "最後は、押しつけがましくならないよう食べたものの記録や栄養相談へ自然に案内してください。\n"
+        "会話を長引かせる質問はせず、相手が自然に会話を終えられる締めくくりにしてください。\n"
+        "意味の読み取りにくい入力には、問い詰めたり不自然に聞き返したりせず、軽く受け流してから短く本来の話題へつなげてください。\n"
         + MEDICAL_GUARDRAIL
     )
     
