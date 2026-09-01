@@ -860,14 +860,36 @@ def initial_setup_message(user_id, text, user=_NOT_PROVIDED):
         value = number_or_none(text, 0.5, 24)
         if value is None:
             return "達成希望期間は0.5〜24の半角数字（月数）で教えてください。（例: 3）"
-        completed_user = sheets.save_user(user_id, "completed", {"target_months": value})
+        # ダッシュボード側との整合性、およびBot側のカロリー計算（1ヶ月=30日）とズレを生じさせないよう
+        # 1ヶ月は30日固定で計算する（dateutil等によるカレンダー月計算は避けるのが安全）
+        now_jst = datetime.now(ZoneInfo("Asia/Tokyo"))
+
+        # 開始日は今日の日付 (YYYY-MM-DD)
+        target_start_date = now_jst.strftime("%Y-%m-%d")
+
+        target_end_date = (now_jst + timedelta(days=int(value * 30))).strftime("%Y-%m-%d")
+
+        # 互換性のため target_months も同時に保存する（calculate_target_caloriesが参照するため）
+        completed_user = sheets.save_user(user_id, "completed", {
+            "target_months": value,
+            "target_start_date": target_start_date,
+            "target_end_date": target_end_date
+            })
+
         calories = calculate_target_calories(completed_user)
         sheets.save_user(user_id, "completed", calories)
+
         mode_label = "減量モード" if completed_user.get("goal_mode") == "loss" else "増量モード"
         pace_note = build_pace_note(completed_user)
+
+        # 開始日と終了日をユーザーに通知してあげると親切です
+        start_date_display = now_jst.strftime("%m月%d日")
+        end_date_display = (now_jst + timedelta(days=int(value * 30))).strftime("%m月%d日")
+
         return (
             "設定が完了しました！\n\n"
             f"1日の目標摂取カロリー：【 {calories['target_calories']} kcal 】（{mode_label}）\n"
+            f"計画期間：{start_date_display} 〜 {end_date_display} まで（約{int(value * 30)}日間）\n"
             f"{pace_note}\n"
             "次は食事写真を送ると、カロリーを記録できます。"
         )

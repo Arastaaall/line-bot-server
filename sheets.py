@@ -36,6 +36,8 @@ USER_COLUMNS = {
     "meal_style": "meal_style",
     "cravings_trigger": "cravings_trigger",
     "target_months": "target_months",
+    "target_start_date": "target_end_date",  # ← 新規追加 plan開始日
+    "target_end_date": "target_end_date",  # ← 新規追加　plan終了日
     "last_log_id": "last_log_id",
 }
 
