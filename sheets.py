@@ -203,9 +203,15 @@ def save_user(user_id: str, status: str, updates: dict[str, Any] | None = None) 
     }
     return saved
 
-MICRONUTRIENT_COLUMNS = {
+# 【Phase4.1】栄養素キーの正本。以前はここ（MICRONUTRIENT_COLUMNS）と
+# main.pyのMICRONUTRIENT_KEYS、save_log()/update_last_log()の個別キーワード引数の
+# 3箇所に同じ栄養素名リストが分散しており、追加・削除時に直し漏れが起きやすかった。
+# 以後はこのタプルを唯一の正本とし、main.py側はここからimportして使う。
+MICRONUTRIENT_KEYS = (
     "fiber", "vitamins", "vit_a", "vit_c", "zinc", "magnesium", "iron", "potassium", "calcium",
-}
+    "vit_d", "vit_e", "vit_b1", "vit_b2", "vit_b6", "vit_b12", "folate",
+)
+MICRONUTRIENT_COLUMNS = set(MICRONUTRIENT_KEYS)
 
 def save_log(
     user_id: str,
@@ -219,43 +225,36 @@ def save_log(
     *,
     log_type: str = "食事",
     image_url: str = "",
-    fiber: float = 0,
-    vitamins: float = 0,
-    vit_a: float = 0,
-    vit_c: float = 0,
-    zinc: float = 0,
-    magnesium: float = 0,
-    iron: float = 0,
-    potassium: float = 0,
-    calcium: float = 0,
+    micronutrients: dict[str, float] | None = None,
 ) -> str:
-    """ログを保存し、log_idを返す。"""
+    """ログを保存し、log_idを返す。
+
+    【Phase4.1】以前は微量栄養素を9個の個別キーワード引数として受け取っていたため、
+    栄養素が増えるたびにこの関数のシグネチャ自体を書き換える必要があった。
+    以後はmicronutrients辞書で一括受け取りにし、MICRONUTRIENT_KEYSに存在するキーだけを
+    書き込む（未指定のキーは0として補完する）。
+    """
+    micronutrients = micronutrients or {}
     log_id = uuid.uuid4().hex[:12]
+    row = {
+        "timestamp": _now(),
+        "log_id": log_id,
+        "user_id": user_id,
+        "user_name": user_name,
+        "type": log_type,
+        "menu_name": menu_name,
+        "calories": calories,
+        "protein": protein,
+        "fat": fat,
+        "carbs": carbs,
+        "imgUrl": image_url,
+        "advice": advice,
+    }
+    for key in MICRONUTRIENT_KEYS:
+        row[key] = micronutrients.get(key, 0)
     _append_by_header(
         "logs",
-        {
-            "timestamp": _now(),
-            "log_id": log_id,
-            "user_id": user_id,
-            "user_name": user_name,
-            "type": log_type,
-            "menu_name": menu_name,
-            "calories": calories,
-            "protein": protein,
-            "fat": fat,
-            "carbs": carbs,
-            "imgUrl": image_url,
-            "advice": advice,
-            "fiber": fiber,
-            "vitamins": vitamins,
-            "vit_a": vit_a,
-            "vit_c": vit_c,
-            "zinc": zinc,
-            "magnesium": magnesium,
-            "iron": iron,
-            "potassium": potassium,
-            "calcium": calcium,
-        },
+        row,
         optional_keys=MICRONUTRIENT_COLUMNS | {"log_id"},
     )
     return log_id
@@ -308,17 +307,13 @@ def update_last_log(
     advice: str,
     *,
     log_id: str | None = None,
-    fiber: float = 0,
-    vitamins: float = 0,
-    vit_a: float = 0,
-    vit_c: float = 0,
-    zinc: float = 0,
-    magnesium: float = 0,
-    iron: float = 0,
-    potassium: float = 0,
-    calcium: float = 0,
+    micronutrients: dict[str, float] | None = None,
 ) -> bool:
-    """log_id指定、または最後のログを更新する。"""
+    """log_id指定、または最後のログを更新する。
+
+    【Phase4.1】save_log()と同じ理由で、微量栄養素は個別キーワード引数ではなく
+    micronutrients辞書で受け取る形に統一した。
+    """
     # 【優先1修正】log_idが指定されている場合はそのIDのみを検索し、見つからなければ失敗とする。
     # 勝手に別の最新ログを修正してしまう危険を防ぐ。
     if log_id:
@@ -333,6 +328,7 @@ def update_last_log(
     row_number, _ = found
     sheet = _worksheet("logs")
     headers = _headers(sheet)
+    micronutrients = micronutrients or {}
     updates = {
         "menu_name": menu_name,
         "calories": calories,
@@ -340,18 +336,11 @@ def update_last_log(
         "fat": fat,
         "carbs": carbs,
         "advice": advice,
-        "fiber": fiber,
-        "vitamins": vitamins,
-        "vit_a": vit_a,
-        "vit_c": vit_c,
-        "zinc": zinc,
-        "magnesium": magnesium,
-        "iron": iron,
-        "potassium": potassium,
-        "calcium": calcium,
     }
+    for key in MICRONUTRIENT_KEYS:
+        updates[key] = micronutrients.get(key, 0)
     # 【軽量化】以前はここで列ごとに update_cell() を個別に呼んでおり、
-    # 微量栄養素9項目＋主要項目を合わせると1回の修正で最大13回もの
+    # 微量栄養素項目＋主要項目を合わせると1回の修正で最大十数回もの
     # 書き込みAPIコールが発生していた（無料枠のクォータ・応答速度の両方を圧迫する）。
     # gspreadのbatch_update()で1回のAPI呼び出しにまとめる。
     # 列が連続しているとは限らないため、セル単位のrange指定を複数まとめて1リクエストにする。
@@ -368,12 +357,26 @@ def update_last_log(
 def save_push_log(user_id: str, reason: str) -> None:
     _append_by_header("push_logs", {"Timestamp": _now(), "User ID": user_id, "Reason": reason})
 
-def save_error_log(user_id: str | None, function_name: str, error_message: str) -> None:
+def save_error_log(
+    user_id: str | None,
+    function_name: str,
+    error_message: str,
+    *,
+    stage: str = "",
+) -> None:
     """エラーログを保存する（例外を握りつぶさない）。
 
     【修正】以前は _append_by_header をtry内と、その直後（try/exceptの外）の
     計2回呼んでいたため、エラーが起きるたびに同じ行が2行ずつerror_logsシートに
     書き込まれ、Sheets APIの呼び出し回数も無駄に倍になっていた。1回だけ書き込む。
+
+    【Phase4.1】stage引数を追加。栄養素抽出のGeminiプロンプトを4経路
+    （text:meal_add / text:meal_correction / text:legacy_classify /
+    image:main / image:groq_fallback 等）で共通化した結果、function_nameだけでは
+    どの経路で失敗したのか区別しづらくなったため、呼び出し元が任意でstageを渡せるようにした。
+    stage省略時は空文字のまま書き込む（既存の呼び出し箇所は変更不要・後方互換）。
+    error_logsシートにstage列が無い場合でも _append_by_header の optional_keys指定により
+    エラーにはならず、その項目だけ外して書き込まれる。
     """
     try:
         import traceback
@@ -391,8 +394,10 @@ def save_error_log(user_id: str | None, function_name: str, error_message: str) 
                 "timestamp": _now(),
                 "user_id": user_id or "",
                 "function_name": function_name,
+                "stage": stage,
                 "error_message": error_message,
             },
+            optional_keys={"stage"},
         )
     except Exception as e:
         # Sheetsへの保存自体に失敗した場合は、標準エラー出力に記録

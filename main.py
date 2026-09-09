@@ -25,6 +25,10 @@ from openai import OpenAI  # Groq接続用
 from pydantic import BaseModel
 import json
 import sheets
+# 【Phase4.1】栄養素キーの正本はsheets.py側（DB列と直結するため）に一元化する。
+# 以前はmain.py側に別途 MICRONUTRIENT_KEYS を定義しており、栄養素の追加・削除時に
+# 2箇所を同時に直す必要があった。
+from sheets import MICRONUTRIENT_KEYS
 
 import logging
 import traceback
@@ -39,6 +43,58 @@ logger = logging.getLogger(__name__)
 # 生成結果が空・placeholder・プロンプト漏洩などになった場合だけ使う案内。
 # 正常な雑談返信へ毎回追加しない（話題と無関係な記録催促を防ぐ）。
 CHAT_GUIDANCE = "食事の記録や栄養相談があれば、いつでも気軽に声をかけてくださいね。"
+
+# 【Phase4.1】栄養素ごとの単位ラベル（Geminiプロンプトの出力スキーマ生成専用）。
+# 実際の保存・検証ロジックには使わない（そちらは MICRONUTRIENT_KEYS / 下記の上限値表を使う）。
+# 新規7栄養素はµg/mgが混在するため、プロンプト側で単位を明示しないと
+# Geminiが桁を取り違えるリスクが既存栄養素より高い。
+NUTRIENT_UNIT_LABELS = {
+    "fiber": "g", "vitamins": "mg", "vit_a": "IU", "vit_c": "mg",
+    "zinc": "mg", "magnesium": "mg", "iron": "mg", "potassium": "mg", "calcium": "mg",
+    "vit_d": "µg", "vit_e": "mg", "vit_b1": "mg", "vit_b2": "mg",
+    "vit_b6": "mg", "vit_b12": "µg", "folate": "µg",
+}
+
+def _nutrient_schema_lines(indent: str = "  ") -> str:
+    """MICRONUTRIENT_KEYSから、Geminiプロンプト用のJSON出力スキーマ行を生成する。
+
+    【Phase4.1】以前は栄養素のJSONスキーマ（"fiber": 数値, ...）が
+    analyze_text_for_extraction / analyze_text_input / call_groq_vision / analyze_image の
+    4箇所へ個別にコピーされていた。栄養素の追加・削除のたびに4箇所を漏れなく直す必要があり、
+    経路間で抽出対象の栄養素が食い違うリスクがあったため、ここに一元化する。
+    """
+    return "\n".join(
+        f'{indent}"{key}": 数値（{NUTRIENT_UNIT_LABELS.get(key, "単位なし")}）,'
+        for key in MICRONUTRIENT_KEYS
+    )
+
+# 【Phase4.1】異常値（単位取り違え等によるGemini誤抽出）を検知するための、
+# 栄養素ごとの暫定上限値。既存9栄養素・新規7栄養素の計16種すべてに適用する。
+# 値はNutrition_Referenceの目安値のおおよそ10〜20倍を仮置きしたもので、
+# 実データを見ながらチームで調整する前提（本実装では「仕組みを入れる」ことを優先する）。
+MICRONUTRIENT_UPPER_BOUNDS = {
+    "fiber": 100, "vitamins": 100, "vit_a": 60000, "vit_c": 3000,  # vit_a: レバー食(IU)の正規値保護
+    "zinc": 100, "magnesium": 1000, "iron": 100, "potassium": 10000, "calcium": 5000,
+    "vit_d": 200, "vit_e": 150, "vit_b1": 30, "vit_b2": 30,
+    "vit_b6": 30, "vit_b12": 300, "folate": 5000,  # vit_b12: 貝類/レバー食の正規値保護
+}
+
+def _micronutrient_or_zero(key, value, digits=1):
+    """微量栄養素の値を検証する。型変換に失敗した場合、負の値、または
+    非現実的に大きい値（単位取り違え等の誤抽出が疑われる値）は0として扱う。
+
+    【Phase4.1】既存の「PFCが異常値なら0扱いにする」という設計思想
+    （validate_nutrition_data参照）を、微量栄養素にも拡張したもの。
+    以前は _number_or_zero() が型変換失敗時のみ0にしており、上限チェックが無かった。
+    """
+    try:
+        parsed = round(float(value), digits)
+    except (TypeError, ValueError):
+        return 0
+    upper = MICRONUTRIENT_UPPER_BOUNDS.get(key)
+    if parsed < 0 or (upper is not None and parsed > upper):
+        return 0
+    return parsed
 
 # 【追加】「使い方」「カロリー確認」「振り返り」は完全一致の文言だけでなく、
 # 「トータルカロリーの確認」のような言い回しでも確実に固定コマンドとして
@@ -348,7 +404,7 @@ async def process_internal_text_event(
             error_detail = f"{str(exc)}\n{traceback.format_exc()}"
             logger.error(f"タイムアウト後の処理でエラー(internal数値抽出): user_id={user_id}, {error_detail}")
             try:
-                await asyncio.to_thread(sheets.save_error_log, user_id, "process_internal_text_event(timeout)", error_detail)
+                await asyncio.to_thread(sheets.save_error_log, user_id, "process_internal_text_event(timeout)", error_detail, stage=f"text:{intent_from_workers}")
             except Exception:
                 pass
             await asyncio.to_thread(
@@ -360,7 +416,7 @@ async def process_internal_text_event(
         error_detail = f"{str(exc)}\n{traceback.format_exc()}"
         logger.error(f"数値抽出でエラー(internal): user_id={user_id}, text={text[:50]}, {error_detail}")
         try:
-            await asyncio.to_thread(sheets.save_error_log, user_id, "process_internal_text_event", error_detail)
+            await asyncio.to_thread(sheets.save_error_log, user_id, "process_internal_text_event", error_detail, stage=f"text:{intent_from_workers}")
         except Exception:
             pass
         await _reply_or_push(
@@ -413,7 +469,7 @@ async def process_text_meal_or_chat_legacy(reply_token: str | None, user_id: str
             error_detail = f"{str(exc)}\n{traceback.format_exc()}"
             logger.error(f"タイムアウト後の処理でエラー(internal): user_id={user_id}, {error_detail}")
             try:
-                await asyncio.to_thread(sheets.save_error_log, user_id, "process_text_meal_or_chat_legacy(timeout)", error_detail)
+                await asyncio.to_thread(sheets.save_error_log, user_id, "process_text_meal_or_chat_legacy(timeout)", error_detail, stage="text:legacy_classify")
             except Exception:
                 pass
             await asyncio.to_thread(
@@ -425,7 +481,7 @@ async def process_text_meal_or_chat_legacy(reply_token: str | None, user_id: str
         error_detail = f"{str(exc)}\n{traceback.format_exc()}"
         logger.error(f"テキスト解析でエラー(internal): user_id={user_id}, text={text[:50]}, {error_detail}")
         try:
-            await asyncio.to_thread(sheets.save_error_log, user_id, "process_text_meal_or_chat_legacy", error_detail)
+            await asyncio.to_thread(sheets.save_error_log, user_id, "process_text_meal_or_chat_legacy", error_detail, stage="text:legacy_classify")
         except Exception:
             pass
         await _reply_or_push(
@@ -482,7 +538,7 @@ async def process_internal_image_event(user_id: str, reply_token: str | None, me
         except Exception as exc:
             try:
                 error_detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-                await asyncio.to_thread(sheets.save_error_log, user_id, "process_internal_image_event", error_detail)
+                await asyncio.to_thread(sheets.save_error_log, user_id, "process_internal_image_event", error_detail, stage="image:main")
             except Exception:
                 pass
             await _reply_or_push(
@@ -494,7 +550,7 @@ async def process_internal_image_event(user_id: str, reply_token: str | None, me
     except Exception as exc:
         error_detail = f"{str(exc)}\n\n--- Stack Trace ---\n{traceback.format_exc()}"
         try:
-            await asyncio.to_thread(sheets.save_error_log, user_id, "process_internal_image_event", error_detail)
+            await asyncio.to_thread(sheets.save_error_log, user_id, "process_internal_image_event", error_detail, stage="image:main")
         except Exception:
             pass
 
@@ -518,11 +574,10 @@ def analyze_text_for_extraction(text: str, user: dict, last_meal_context: dict |
     出力形式:
     {{
       "menu_name": "...", "calories": 数値, "protein": 数値, "fat": 数値, "carbs": 数値,
-      "fiber": 数値, "vitamins": 数値, "vit_a": 数値, "vit_c": 数値, "zinc": 数値,
-      "magnesium": 数値, "iron": 数値, "potassium": 数値, "calcium": 数値,
+{_nutrient_schema_lines(indent="      ")}
       "suggestion": "アドバイス（食事でない場合は、ユーザーへの通常の返信メッセージ）"
     }}
-    微量栄養素は推定値で構いません（数値のみ、単位なし）。
+    微量栄養素は推定値で構いません（数値のみ。括弧内の単位はキーの意味を示すためのものです）。
     """
     # 既存の generate_content_with_fallback を使用
     payload = {
@@ -562,11 +617,13 @@ def analyze_text_for_extraction(text: str, user: dict, last_meal_context: dict |
         # 【修正】微量栄養素キーが欠けたまま _apply_meal_add / _apply_meal_correction に渡すと
         # MICRONUTRIENT_KEYS を参照する箇所で KeyError になっていたため、0埋めで必ず補完する。
         for key in MICRONUTRIENT_KEYS:
-            result[key] = _number_or_zero(validated_data.get(key))
+            result[key] = _micronutrient_or_zero(key, validated_data.get(key))
         return result
     except Exception as e:
         # バリデーション失敗時はエラーログに出し、雑談扱いにして逃がす
-        sheets.save_error_log(user["user_id"], "validate_nutrition_data", str(e))
+        # 【Phase4.1】stageにforce_intentを含め、テキストのどちらの経路
+        # （meal_add / meal_correction）で失敗したかを区別できるようにする。
+        sheets.save_error_log(user["user_id"], "validate_nutrition_data", str(e), stage=f"text:{force_intent}")
         return {
             "type": "chat",
             "reply": "申し訳ありません。うまく読み取れませんでした。食べたものをもう一度教えてくださいね。",
@@ -1035,11 +1092,10 @@ def analyze_text_input(text: str, user: dict, last_meal_context: dict | None) ->
         '  "intent": "meal_add または meal_correction",\n'
         '  "menu_name": "料理名",\n'
         '  "calories": 数値, "protein": 数値, "fat": 数値, "carbs": 数値,\n'
-        '  "fiber": 数値, "vitamins": 数値, "vit_a": 数値, "vit_c": 数値, "zinc": 数値,\n'
-        '  "magnesium": 数値, "iron": 数値, "potassium": 数値, "calcium": 数値,\n'
+        f"{_nutrient_schema_lines()}\n"
         '  "suggestion": "アドバイス"\n'
         "}\n"
-        "微量栄養素は推定値で構いません（数値のみ、単位なし）。\n\n"
+        "微量栄養素は推定値で構いません（数値のみ。括弧内の単位はキーの意味を示すためのものです）。\n\n"
         "食事に関係ない場合：\n"
         '{ "intent": "chat", "reply": "ユーザーへの返信メッセージ" }\n'
         "chatの返信は、次の考え方で1〜2文の温かく自然な日本語にしてください。\n"
@@ -1122,7 +1178,7 @@ def parse_text_intent_result(response_json: dict, *, allow_correction: bool) -> 
             "suggestion": str(data["suggestion"]).strip(),
         }
         for key in MICRONUTRIENT_KEYS:
-            result[key] = _number_or_zero(data.get(key))
+            result[key] = _micronutrient_or_zero(key, data.get(key))
         return result
         
     except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1233,7 +1289,7 @@ def _apply_meal_add(user_id, user, result, today_logs_before):
         advice=result["suggestion"],
         log_type="食事追加",  # 画像経由の「食事」と区別
         **{key: result[key] for key in ("menu_name", "calories", "protein", "fat", "carbs")},
-        **{key: result[key] for key in MICRONUTRIENT_KEYS},
+        micronutrients={key: result[key] for key in MICRONUTRIENT_KEYS},
     )
     sheets.save_user(user_id, "awaiting_correction", {"last_log_id": log_id})
     
@@ -1269,7 +1325,7 @@ def _apply_meal_correction(user_id, user, result):
         result["menu_name"], result["calories"], result["protein"], result["fat"], result["carbs"],
         result["suggestion"],
         log_id=log_id,
-        **{key: result[key] for key in MICRONUTRIENT_KEYS},
+        micronutrients={key: result[key] for key in MICRONUTRIENT_KEYS},
     )
     if not ok:
         # 修正対象が見つからなかった。completedへ戻し、ユーザーへ正直に伝える。
@@ -1324,7 +1380,7 @@ async def process_text_meal_or_chat(event, user_id, user, text):
             error_detail = f"{str(exc)}\n{traceback.format_exc()}"
             logger.error(f"タイムアウト後の処理でエラー: user_id={user_id}, {error_detail}")
             try:
-                await asyncio.to_thread(sheets.save_error_log, user_id, "process_text_event(timeout)", error_detail)
+                await asyncio.to_thread(sheets.save_error_log, user_id, "process_text_event(timeout)", error_detail, stage="text:legacy_classify")
             except Exception:
                 pass
             await asyncio.to_thread(
@@ -1336,7 +1392,7 @@ async def process_text_meal_or_chat(event, user_id, user, text):
         error_detail = f"{str(exc)}\n{traceback.format_exc()}"
         logger.error(f"テキスト解析でエラー: user_id={user_id}, text={text[:50]}, {error_detail}")
         try:
-            await asyncio.to_thread(sheets.save_error_log, user_id, "process_text_event", error_detail)
+            await asyncio.to_thread(sheets.save_error_log, user_id, "process_text_event", error_detail, stage="text:legacy_classify")
         except Exception:
             pass
         await _reply_or_push(
@@ -1534,15 +1590,7 @@ def call_groq_vision(image_bytes, mime_type):
         '  "protein": 数値（g）,\n'
         '  "fat": 数値（g）,\n'
         '  "carbs": 数値（g）,\n'
-        '  "fiber": 数値（g）,\n'
-        '  "vitamins": 数値（mg）,\n'
-        '  "vit_a": 数値（IU）,\n'
-        '  "vit_c": 数値（mg）,\n'
-        '  "zinc": 数値（mg）,\n'
-        '  "magnesium": 数値（mg）,\n'
-        '  "iron": 数値（mg）,\n'
-        '  "potassium": 数値（mg）,\n'
-        '  "calcium": 数値（mg）,\n'
+        f"{_nutrient_schema_lines()}\n"
         '  "suggestion": "次の食事へのアドバイス（日本語）"\n'
         "}\n\n"
         "【注意】\n"
@@ -1653,7 +1701,7 @@ def generate_content_with_fallback(
             return groq_result, notice
         except Exception as exc:
             try:
-                sheets.save_error_log(user_id, "groq_fallback_failed", str(exc))
+                sheets.save_error_log(user_id, "groq_fallback_failed", str(exc), stage="image:groq_fallback")
             except Exception:
                 pass
             raise RuntimeError(f"GeminiとGroqの両方で{action_label}に失敗しました。") from exc
@@ -1675,15 +1723,7 @@ def analyze_image(image_bytes, mime_type, user_id=None):
         '    "protein": 20,\n'
         '    "fat": 15,\n'
         '    "carbs": 80,\n'
-        '    "fiber": 3,\n'
-        '    "vitamins": 5,\n'
-        '    "vit_a": 80,\n'
-        '    "vit_c": 15,\n'
-        '    "zinc": 1.5,\n'
-        '    "magnesium": 40,\n'
-        '    "iron": 1.2,\n'
-        '    "potassium": 400,\n'
-        '    "calcium": 60,\n'
+        f"{_nutrient_schema_lines(indent='    ')}\n"
         '    "suggestion": "アドバイスメッセージ"\n'
         "}"
         + MEDICAL_GUARDRAIL
@@ -1710,20 +1750,13 @@ def analyze_image(image_bytes, mime_type, user_id=None):
         result["_gemini_fallback_notice"] = fallback_notice
     return result
 
+# 【Phase4.1】MICRONUTRIENT_KEYS は sheets.py 側からimport済み（このファイル冒頭を参照）。
 # 微量栄養素はGeminiが省略することがあるため、必須項目には含めず、
-# 数値変換に失敗した場合や欠けている場合は0として扱う。
-MICRONUTRIENT_KEYS = (
-    "fiber", "vitamins", "vit_a", "vit_c", "zinc", "magnesium", "iron", "potassium", "calcium",
-)
-
-def _number_or_zero(value, digits=1):
-    try:
-        return round(float(value), digits)
-    except (TypeError, ValueError):
-        return 0
+# 数値変換に失敗した場合・欠けている場合・異常値の場合は0として扱う
+# （検証本体は _micronutrient_or_zero、このファイル上部を参照）。
 
 def parse_analysis_result(response_json):
-    """Geminiの返事から、保存に必要な値（主要栄養素6つ＋微量栄養素9つ）を取り出す。"""
+    """Geminiの返事から、保存に必要な値（主要栄養素6つ＋微量栄養素16種）を取り出す。"""
     try:
         raw_text = response_json["candidates"][0]["content"]["parts"][0]["text"]
         first_brace, last_brace = raw_text.find("{"), raw_text.rfind("}")
@@ -1748,7 +1781,7 @@ def parse_analysis_result(response_json):
             "suggestion": str(data["suggestion"]).strip(),
         }
         for key in MICRONUTRIENT_KEYS:
-            result[key] = _number_or_zero(data.get(key))
+            result[key] = _micronutrient_or_zero(key, data.get(key))
         return result
     except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise RuntimeError("Geminiの解析結果の形式が正しくありませんでした。") from exc
@@ -1761,7 +1794,7 @@ def save_analysis_and_build_message(user_id, user, result):
         user_id, user_name,
         advice=result["suggestion"],
         **{key: result[key] for key in ("menu_name", "calories", "protein", "fat", "carbs")},
-        **{key: result[key] for key in MICRONUTRIENT_KEYS},
+        micronutrients={key: result[key] for key in MICRONUTRIENT_KEYS},
     )
     sheets.save_user(user_id, "awaiting_correction", {"last_log_id": log_id})
     today_logs = sheets.get_today_logs(user_id)
@@ -1888,7 +1921,7 @@ async def _process_image_event_inner(event):
         except Exception as exc:
             try:
                 error_detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-                await asyncio.to_thread(sheets.save_error_log, user_id, "process_image_event", error_detail)
+                await asyncio.to_thread(sheets.save_error_log, user_id, "process_image_event", error_detail, stage="image:main")
             except Exception:
                 pass
             await _reply_or_push(
@@ -1901,7 +1934,7 @@ async def _process_image_event_inner(event):
         # 【修正】スタックトレースを含めてログに記録
         error_detail = f"{str(exc)}\n\n--- Stack Trace ---\n{traceback.format_exc()}"
         try:
-            await asyncio.to_thread(sheets.save_error_log, user_id, "process_image_event", error_detail)
+            await asyncio.to_thread(sheets.save_error_log, user_id, "process_image_event", error_detail, stage="image:main")
         except Exception:
             pass
             
