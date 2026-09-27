@@ -93,8 +93,29 @@ function truncateForLine(text: string, maxLength = 5000): string {
 }
 
 function looksLikeMealCorrection(text: string): boolean {
-  const mealContext = /(食べ|食事|料理|メニュー|記録|カロリー|栄養|ご飯|ごはん|朝食|昼食|夕食|おやつ|間食|飲み物|食品|食材|写真)/.test(text);
-  return mealContext && /(じゃなくて|ではなくて|ではなく|代わりに|違いまし|間違い|訂正|修正|本当は|正しくは|(?:さっき|先ほど)の(?:食事|記録|写真|メニュー|料理)|前の食事(?:は|が).*(?:違う|間違|ではなく|じゃなく)|食事記録.*(?:訂正|修正|違う))/.test(text);
+
+  // 【追加】テキストの正規化（全角/半角スペースの統一）
+  const normalized = text.trim().replace(/[\s ]+/g, ' ');
+
+  // 【追加】① 明確な置換構文 (A→B, A->B, A ⇒ B など)
+  // 左辺と右辺が空でないことを簡易チェック
+  const arrowRegex = /^(.+?)[\s ]*[→⇒➡\->]+[\s ]*(.+)$/;
+  if (arrowRegex.test(normalized)) {
+    return true; 
+  }
+
+  // 【追加】② 自然言語による置換 (AをBに変更, AじゃなくてB)
+  const replaceRegex = /(.+?)[をって][\s ]*(.+?)(?:に変更|にして|に変えて|の代わりに)/;
+  const notRegex = /(.+?)(?:じゃなくて|ではなく|じゃなく|ではなくて)[\s ]*(.+)$/;
+  if (replaceRegex.test(normalized) || notRegex.test(normalized)) {
+    return true;
+  }
+
+  // ③ 既存のキーワード判定 (食事関連語 + 修正表現)
+  const mealContext = /(食べ|食事|料理|メニュー|記録|カロリー|栄養|ご飯|ごはん|朝食|昼食|夕食|おやつ|間食|飲み物|食品|食材|写真)/.test(normalized);
+  const correctionContext = /(じゃなくて|ではなくて|ではなく|代わりに|違いまし|間違い|訂正|修正|本当は|正しくは|(?:さっき|先ほど)の(?:食事|記録|写真|メニュー|料理)|前の食事(?:は|が).(?:違う|間違|ではなく|じゃなく)|食事記録.(?:訂正|修正|違う))/.test(normalized);
+
+  return mealContext && correctionContext;
 }
 
 function getDeterministicChatReply(text: string): { reply: string; rule: string } | null {

@@ -3,6 +3,30 @@ nest_asyncio.apply()
 
 import os
 import re
+
+def extract_correction_action(text: str) -> dict | None:
+    """
+    ユーザー入力から修正アクション（置換）を抽出する。
+    対応: A→B, A->B, AをBに変更, AじゃなくてB
+    """
+    normalized = text.strip()
+    
+    # パターン1: 矢印 (A→B)
+    m = re.match(r'^(.+?)[\s ]*[→⇒➡\->]+[\s ]*(.+)$', normalized)
+    if m:
+        return {"type": "replace", "target": m.group(1).strip(), "replacement": m.group(2).strip()}
+        
+    # パターン2: 自然言語 (AをBに変更 / AじゃなくてB)
+    m = re.search(r'(.+?)[をって][\s ]*(.+?)(?:に変更|にして|に変えて|の代わりに)', normalized)
+    if m:
+        return {"type": "replace", "target": m.group(1).strip(), "replacement": m.group(2).strip()}
+        
+    m = re.search(r'(.+?)(?:じゃなくて|ではなく|じゃなく|ではなくて)[\s ]*(.+)$', normalized)
+    if m:
+        return {"type": "replace", "target": m.group(1).strip(), "replacement": m.group(2).strip()}
+
+    return None
+
 import asyncio
 import base64
 import json
@@ -371,8 +395,62 @@ async def process_internal_text_event(
     # 修正モードの安全性チェック
     if intent_from_workers == "meal_correction":
         if user.get("status") != "awaiting_correction" or not correction_is_open(user):
-            # 修正受付時間外なら、新規追加として扱う
             intent_from_workers = "meal_add"
+        else:
+            # --- 【新ロジック】Python側での確定置換処理 ---
+            action = extract_correction_action(text)
+            last_log_info = _build_last_meal_context(user) # 直前ログのmenu_name等を取得
+            
+            if action and last_log_info:
+                target = action["target"]
+                replacement = action["replacement"]
+                current_menu = last_log_info["menu_name"]
+                
+                # メニュー名の置換処理 (カンマや・で区切られていると仮定)
+                # 単純な文字列置換ではなく、アイテム単位で置換する
+                items = re.split(r'[,、\n]', current_menu)
+                new_items = []
+                found = False
+                
+                for item in items:
+                    item_clean = item.strip()
+                    # 完全一致または包含マッチで判定
+                    if target in item_clean or item_clean in target:
+                        new_items.append(replacement)
+                        found = True
+                    else:
+                        new_items.append(item_clean)
+                
+                if found:
+                    # 置換後のメニュー文字列を作成 (例: "卵焼き, 味噌汁, 味ご飯")
+                    new_menu_str = ", ".join(new_items)
+                    
+                    # 【重要】Geminiには「修正後のメニュー文字列」を渡して栄養価を再計算させる
+                    # force_intent="meal_add" として、単なる食事記録として解析させる
+                    async def analyze_new_menu():
+                        return await asyncio.to_thread(
+                            analyze_text_for_extraction,
+                            new_menu_str, user, None, force_intent="meal_add"
+                        )
+                    
+                    task = asyncio.create_task(analyze_new_menu())
+                    try:
+                        result = await asyncio.wait_for(asyncio.shield(task), timeout=TEXT_TOTAL_TIMEOUT)
+                        # 結果を修正ログとして保存 (log_idを指定して上書き)
+                        # _apply_meal_correction 内の sheets.update_last_log が log_id を使って更新する
+                        await asyncio.to_thread(_deliver_text_analysis_result, reply_token, user_id, user, result, is_push=False)
+                        return # 正常終了したのでここで抜ける
+                    except Exception as e:
+                        logger.error(f"再計算中にエラー: {e}")
+                        # エラー時は下のフォールバックへ
+                        
+                else:
+                    # Targetが見つからなかった場合 (チャッピー案11)
+                    await _reply_or_push(
+                        user_id, reply_token, 
+                        f"「{target}」が直前の記録に見つかりませんでした。\n変更したいメニューを確認して、もう一度教えてください。"
+                    )
+                    return
 
     # 数値抽出用プロンプトでGemini呼び出し
     # 【修正】以前はここに時間の上限が一切無く、Gemini呼び出しが長引くと
