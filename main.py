@@ -149,6 +149,35 @@ groq_client = OpenAI(
     base_url="https://api.groq.com/openai/v1"
 )
 
+# --- Groqフォールバック制御（2026-09 追加） ---
+USE_GROQ_FALLBACK = os.environ.get("USE_GROQ_FALLBACK", "false").strip().lower() in ("1", "true", "yes")
+GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "qwen/qwen3.8-27b").strip()
+GROQ_VISION_CANDIDATES = [
+    m.strip() for m in os.environ.get("GROQ_VISION_CANDIDATES", "").split(",") if m.strip()
+]
+
+def _groq_live_models() -> set:
+    """Groqで現在配信中のモデルID一覧。取得失敗時は空集合（＝賭けない）。"""
+    try:
+        return {m.id for m in groq_client.models.list().data}
+    except Exception as exc:
+        logger.warning("Groqモデル一覧の取得に失敗しました: %s", exc)
+        return set()
+
+def resolve_groq_vision_model():
+    """候補のうち配信中の最初のモデルを返す。フラグOFF・一覧失敗・全滅ならNone。"""
+    if not USE_GROQ_FALLBACK:
+        return None
+    live = _groq_live_models()
+    if not live:
+        return None
+    candidates = ([GROQ_VISION_MODEL] if GROQ_VISION_MODEL else []) + GROQ_VISION_CANDIDATES
+    for cand in candidates:
+        if cand in live:
+            return cand
+    logger.error("Groq候補モデルがすべて配信終了または未設定: %s", candidates)
+    return None
+
 # 非同期APIではなく、安定した同期APIクライアントを使用（これでイベントループエラーが完全に消えます）
 config = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 api_client = ApiClient(config)
@@ -1677,7 +1706,7 @@ def call_groq_vision(image_bytes, mime_type):
     )
     try:
         response = groq_client.chat.completions.create(
-            model="qwen/qwen3.6-27b",
+            model=GROQ_VISION_MODEL,
             messages=[
                 {
                     "role": "user",
@@ -1761,28 +1790,34 @@ def generate_content_with_fallback(
 
     # 2. Geminiの候補モデルが全滅した場合の処理
     if image_bytes and mime_type:
-        try:
-            groq_json_str = call_groq_vision(image_bytes, mime_type)
-
-            # 【修正】Groqの戻り値をGeminiと同じ構造にラップする
-            groq_result = {
-                "candidates": [{
-                    "content": {
-                        "parts": [{"text": groq_json_str}]
-                    }
-                }]
-            }
-
-            attempts.append(("Groq-Vision", "成功"))
-            history = " → ".join(f"{m}:{status}" for m, status in attempts)
-            notice = f"Geminiが全滅したため、Groq Visionで{action_label}を完了しました（{history}）。"
-            return groq_result, notice
-        except Exception as exc:
+        groq_model = resolve_groq_vision_model()
+        if groq_model:
             try:
-                sheets.save_error_log(user_id, "groq_fallback_failed", str(exc), stage="image:groq_fallback")
-            except Exception:
-                pass
-            raise RuntimeError(f"GeminiとGroqの両方で{action_label}に失敗しました。") from exc
+                groq_json_str = call_groq_vision(image_bytes, mime_type)
+
+                # 【修正】Groqの戻り値をGeminiと同じ構造にラップする
+                groq_result = {
+                    "candidates": [{
+                        "content": {
+                            "parts": [{"text": groq_json_str}]
+                        }
+                    }]
+                }
+
+                attempts.append(("Groq-Vision", "成功"))
+                history = " → ".join(f"{m}:{status}" for m, status in attempts)
+                notice = f"Geminiが全滅したため、Groq Visionで{action_label}を完了しました（{history}）。"
+                return groq_result, notice
+            except Exception as exc:
+                try:
+                    sheets.save_error_log(user_id, "groq_fallback_failed", str(exc), stage="image:groq_fallback")
+                except Exception:
+                    pass
+                raise RuntimeError(f"GeminiとGroqの両方で{action_label}に失敗しました。") from exc
+
+        else:
+            # フラグOFFまたは生存モデルなし：呼ばずに下の正直なエラーへ落ちる
+            attempts.append(("Groq-Vision", "スキップ（無効化または生存モデルなし）"))
 
     # 画像がない（テキスト解析）場合はGroqへフォールバックできないため、ここで失敗として伝える。
     history = " → ".join(f"{m}:{status}" for m, status in attempts) if attempts else "候補モデルなし"
